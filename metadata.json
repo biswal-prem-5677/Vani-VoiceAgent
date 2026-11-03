@@ -1,0 +1,6 @@
+{
+  "name": "VaniVoice AI - Multilingual Multi-Tenant Voice Agent Prototype",
+  "description": "Multilingual multi-tenant voice agent prototype supporting Odia, Hindi, Hinglish, Bengali, and English with turn-taking, barge-in interruptions, tenant-isolated knowledge retrieval, safety emergency detection, and tool calling.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
