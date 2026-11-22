@@ -1,4 +1,4 @@
-import { DocumentChunk } from '../types';
+import type { DocumentChunk } from '../types/index.ts';
 
 export interface SearchResult {
   chunk: DocumentChunk;

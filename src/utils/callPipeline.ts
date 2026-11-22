@@ -1,8 +1,8 @@
-import { SupportedLanguage, TenantConfig, CallTurn, LatencyBreakdown } from '../types';
-import { detectLanguage } from './languageDetector';
-import { searchKnowledgeBase, RELEVANCE_THRESHOLD } from './ragEngine';
-import { executeTenantTool } from './tools';
-import { checkEmergencyCondition, checkHumanEscalationRequest } from './safety';
+import type { SupportedLanguage, TenantConfig, CallTurn, LatencyBreakdown } from '../types/index.ts';
+import { detectLanguage } from './languageDetector.ts';
+import { searchKnowledgeBase, RELEVANCE_THRESHOLD } from './ragEngine.ts';
+import { executeTenantTool } from './tools.ts';
+import { checkEmergencyCondition, checkHumanEscalationRequest } from './safety.ts';
 
 export interface ProcessTurnInput {
   userInput: string;

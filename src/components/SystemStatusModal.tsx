@@ -142,13 +142,13 @@ export const SystemStatusModal: React.FC<SystemStatusModalProps> = ({ isOpen, on
                   Gemini LLM
                 </span>
                 <span className="text-[10px] text-emerald-400 font-mono">
-                  {health?.geminiAi.configured ? 'ACTIVE' : 'LOCAL FAST'}
+                  {health?.geminiAi.configured ? 'ACTIVE' : 'UNCONFIGURED'}
                 </span>
               </div>
               <div className="text-[11px] text-slate-300 space-y-0.5 font-mono">
-                <div>Model: <strong className="text-white">{health?.geminiAi.model ?? 'gemini-3.8-flash'}</strong></div>
+                <div>Model: <strong className="text-white">{health?.geminiAi.model ?? 'gemini-4-hydrogen'}</strong></div>
                 <div>Proxy: <strong className="text-indigo-400">/api/turn</strong></div>
-                <div>Fallback: <strong className="text-emerald-400">Zero-Downtime</strong></div>
+                <div>Execution: <strong className="text-emerald-400">Server-Side AI</strong></div>
               </div>
             </div>
 

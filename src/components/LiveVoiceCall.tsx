@@ -18,8 +18,13 @@ import {
 } from 'lucide-react';
 import { TenantConfig, SupportedLanguage, CallTurn, LatencyBreakdown } from '../types';
 import { SUPPORTED_LANGUAGES } from '../utils/languageDetector';
-import { createSpeechController, SpeechController } from '../utils/speechSynthesis';
-import { processTurn } from '../utils/callPipeline';
+import { createSpeechController } from '../utils/speechSynthesis';
+import {
+  isBenignRecognitionError,
+  isFatalRecognitionError,
+  shouldRestartRecognition,
+  getRecognitionRestartDelayMs,
+} from '../utils/speechRecognition';
 import { AudioOrb } from './AudioOrb';
 
 interface LiveVoiceCallProps {
@@ -45,20 +50,82 @@ export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({ tenant, onCallEnde
   const [humanHandoffNotice, setHumanHandoffNotice] = useState<string | null>(null);
   const [micSupported, setMicSupported] = useState<boolean>(true);
   const [odiaWarning, setOdiaWarning] = useState<string | null>(null);
+  const [micErrorNotice, setMicErrorNotice] = useState<string | null>(null);
+  const [turnErrorNotice, setTurnErrorNotice] = useState<{ message: string; retryText?: string } | null>(null);
+  const [isProcessingTurn, setIsProcessingTurn] = useState<boolean>(false);
 
-  // Stale closure prevention refs
+  // Refs synced immediately with state to eliminate stale closures in SpeechRecognition and async handlers
+  const tenantRef = useRef<TenantConfig>(tenant);
+  const onCallEndedRef = useRef<((callRecord: any) => void) | undefined>(onCallEnded);
   const turnsRef = useRef<CallTurn[]>(turns);
   const callMemoryRef = useRef<Record<string, string>>(callMemory);
   const activeLanguageRef = useRef<SupportedLanguage>(activeLanguage);
   const callActiveRef = useRef<boolean>(callActive);
   const isMutedRef = useRef<boolean>(isMuted);
-  const isSpeakingTtsRef = useRef<boolean>(false);
+  const callDurationRef = useRef<number>(callDuration);
+  const bargeInCountRef = useRef<number>(bargeInCount);
+  const humanHandoffRef = useRef<string | null>(humanHandoffNotice);
+  const lastLatencyRef = useRef<LatencyBreakdown | null>(lastLatency);
 
+  // Recognition lifecycle refs
+  const isSpeakingTtsRef = useRef<boolean>(false);
+  const isRecognizingRef = useRef<boolean>(false);
+  const shouldListenRef = useRef<boolean>(false);
+  const isUnmountedRef = useRef<boolean>(false);
+  const fatalMicErrorRef = useRef<boolean>(false);
+  const consecutiveErrorsRef = useRef<number>(0);
+  const restartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const turnAbortRef = useRef<AbortController | null>(null);
+  const handleUserSpokeRef = useRef<(rawText: string) => Promise<void>>(async () => {});
+
+  useEffect(() => { tenantRef.current = tenant; }, [tenant]);
+  useEffect(() => { onCallEndedRef.current = onCallEnded; }, [onCallEnded]);
   useEffect(() => { turnsRef.current = turns; }, [turns]);
   useEffect(() => { callMemoryRef.current = callMemory; }, [callMemory]);
   useEffect(() => { activeLanguageRef.current = activeLanguage; }, [activeLanguage]);
   useEffect(() => { callActiveRef.current = callActive; }, [callActive]);
   useEffect(() => { isMutedRef.current = isMuted; }, [isMuted]);
+  useEffect(() => { bargeInCountRef.current = bargeInCount; }, [bargeInCount]);
+  useEffect(() => { humanHandoffRef.current = humanHandoffNotice; }, [humanHandoffNotice]);
+  useEffect(() => { lastLatencyRef.current = lastLatency; }, [lastLatency]);
+
+  // Synchronous ref+state updaters prevent races between consecutive events in the same tick
+  const updateCallActive = (active: boolean) => {
+    callActiveRef.current = active;
+    setCallActive(active);
+  };
+
+  const updateIsMuted = (muted: boolean) => {
+    isMutedRef.current = muted;
+    setIsMuted(muted);
+  };
+
+  const updateActiveLanguage = (lang: SupportedLanguage) => {
+    activeLanguageRef.current = lang;
+    setActiveLanguage(lang);
+  };
+
+  const updateCallMemory = (mem: Record<string, string>) => {
+    callMemoryRef.current = mem;
+    setCallMemory(mem);
+  };
+
+  const updateTurns = (nextOrUpdater: CallTurn[] | ((prev: CallTurn[]) => CallTurn[])) => {
+    const next =
+      typeof nextOrUpdater === 'function' ? nextOrUpdater(turnsRef.current) : nextOrUpdater;
+    turnsRef.current = next;
+    setTurns(next);
+  };
+
+  const updateHumanHandoff = (reason: string | null) => {
+    humanHandoffRef.current = reason;
+    setHumanHandoffNotice(reason);
+  };
+
+  const updateLastLatency = (latency: LatencyBreakdown | null) => {
+    lastLatencyRef.current = latency;
+    setLastLatency(latency);
+  };
 
   // Create speech controller once
   const speechCtrl = useMemo(() => createSpeechController(), []);
@@ -80,20 +147,29 @@ export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({ tenant, onCallEnde
       };
       checkOdia();
       window.speechSynthesis.onvoiceschanged = checkOdia;
+      return () => {
+        if (window.speechSynthesis.onvoiceschanged === checkOdia) {
+          window.speechSynthesis.onvoiceschanged = null;
+        }
+      };
     }
   }, [speechCtrl]);
 
   // Duration Timer
   useEffect(() => {
-    let interval: any = null;
+    let interval: ReturnType<typeof setInterval> | null = null;
     if (callActive) {
       interval = setInterval(() => {
-        setCallDuration(d => d + 1);
+        callDurationRef.current += 1;
+        setCallDuration(callDurationRef.current);
       }, 1000);
     } else {
+      callDurationRef.current = 0;
       setCallDuration(0);
     }
-    return () => clearInterval(interval);
+    return () => {
+      if (interval) clearInterval(interval);
+    };
   }, [callActive]);
 
   // Scroll transcript
@@ -101,7 +177,45 @@ export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({ tenant, onCallEnde
     transcriptBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [turns, currentInterimSpeech]);
 
-  // Initialize Speech Recognition
+  const clearRestartTimer = () => {
+    if (restartTimerRef.current !== null) {
+      clearTimeout(restartTimerRef.current);
+      restartTimerRef.current = null;
+    }
+  };
+
+  const canRestartRecognition = () =>
+    shouldRestartRecognition({
+      callActive: callActiveRef.current,
+      isMuted: isMutedRef.current,
+      isSpeakingTts: isSpeakingTtsRef.current,
+      isUnmounted: isUnmountedRef.current,
+      fatalError: fatalMicErrorRef.current,
+      consecutiveErrors: consecutiveErrorsRef.current,
+    });
+
+  const scheduleRecognitionRestart = (overrideDelayMs?: number) => {
+    clearRestartTimer();
+    if (!shouldListenRef.current || !canRestartRecognition()) {
+      return;
+    }
+
+    const delayMs =
+      overrideDelayMs ?? getRecognitionRestartDelayMs(consecutiveErrorsRef.current);
+
+    restartTimerRef.current = setTimeout(() => {
+      restartTimerRef.current = null;
+      if (
+        shouldListenRef.current &&
+        canRestartRecognition() &&
+        !isRecognizingRef.current
+      ) {
+        startListeningMic();
+      }
+    }, delayMs);
+  };
+
+  // Initialize Speech Recognition once; all handlers read from refs to avoid stale closures
   const initSpeechRecognition = () => {
     const SpeechRecognition =
       (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
@@ -117,12 +231,24 @@ export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({ tenant, onCallEnde
     recognition.maxAlternatives = 1;
     recognition.lang = SUPPORTED_LANGUAGES[activeLanguageRef.current]?.sttCode || 'en-IN';
 
+    recognition.onstart = () => {
+      isRecognizingRef.current = true;
+      consecutiveErrorsRef.current = 0;
+      setMicErrorNotice(null);
+    };
+
     recognition.onresult = (event: any) => {
-      // Prevent echo self-barge-in: if TTS is speaking, disregard mic events to avoid speaker loopback
-      if (isSpeakingTtsRef.current) {
+      // Prevent echo self-barge-in or late events after mute/end/unmount
+      if (
+        isSpeakingTtsRef.current ||
+        isMutedRef.current ||
+        !callActiveRef.current ||
+        isUnmountedRef.current
+      ) {
         return;
       }
 
+      consecutiveErrorsRef.current = 0;
       let interim = '';
       let finalTranscript = '';
 
@@ -141,24 +267,47 @@ export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({ tenant, onCallEnde
 
       if (finalTranscript.trim()) {
         setCurrentInterimSpeech('');
-        handleUserSpoke(finalTranscript.trim());
-      }
-    };
-
-    // Auto-restart continuous recognition when Chrome drops connection
-    recognition.onend = () => {
-      if (callActiveRef.current && !isMutedRef.current && !isSpeakingTtsRef.current) {
-        try {
-          recognition.start();
-        } catch {
-          // ignore restart collision
-        }
+        // Always invoke the latest handler via ref (no stale closures)
+        handleUserSpokeRef.current(finalTranscript.trim());
       }
     };
 
     recognition.onerror = (e: any) => {
-      if (e.error !== 'no-speech' && e.error !== 'aborted') {
-        console.warn('Speech recognition warning:', e.error);
+      const errorCode = e?.error || 'unknown';
+      if (isBenignRecognitionError(errorCode)) {
+        return;
+      }
+
+      if (isFatalRecognitionError(errorCode)) {
+        fatalMicErrorRef.current = true;
+        shouldListenRef.current = false;
+        clearRestartTimer();
+        setMicErrorNotice(
+          'Microphone permission was denied or blocked by the browser. You can continue by typing messages below.'
+        );
+        return;
+      }
+
+      consecutiveErrorsRef.current += 1;
+      if (errorCode === 'language-not-supported' && recognitionRef.current) {
+        recognitionRef.current.lang = 'en-IN';
+      }
+
+      if (consecutiveErrorsRef.current >= 5) {
+        shouldListenRef.current = false;
+        setMicErrorNotice(
+          'Voice recognition paused after repeated microphone/network errors. Click unmute or restart the call to retry.'
+        );
+      } else {
+        console.warn('Speech recognition warning:', errorCode);
+      }
+    };
+
+    // Automatic backoff-controlled restart when recognition ends unexpectedly
+    recognition.onend = () => {
+      isRecognizingRef.current = false;
+      if (shouldListenRef.current && canRestartRecognition()) {
+        scheduleRecognitionRestart();
       }
     };
 
@@ -166,86 +315,164 @@ export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({ tenant, onCallEnde
   };
 
   const startListeningMic = () => {
-    if (isMutedRef.current || !callActiveRef.current) return;
+    shouldListenRef.current = true;
+    clearRestartTimer();
+
+    if (
+      isMutedRef.current ||
+      !callActiveRef.current ||
+      isSpeakingTtsRef.current ||
+      isUnmountedRef.current ||
+      fatalMicErrorRef.current
+    ) {
+      return;
+    }
+
+    if (isRecognizingRef.current) {
+      return;
+    }
+
     try {
       if (!recognitionRef.current) {
         recognitionRef.current = initSpeechRecognition();
       }
       if (recognitionRef.current) {
-        recognitionRef.current.lang = SUPPORTED_LANGUAGES[activeLanguageRef.current]?.sttCode || 'en-IN';
+        recognitionRef.current.lang =
+          SUPPORTED_LANGUAGES[activeLanguageRef.current]?.sttCode || 'en-IN';
         recognitionRef.current.start();
       }
     } catch {
-      // already running
+      // Recognition may still be tearing down from a recent abort(); retry cleanly
+      scheduleRecognitionRestart(200);
     }
   };
 
   const stopListeningMic = () => {
+    shouldListenRef.current = false;
+    clearRestartTimer();
+
     if (recognitionRef.current) {
       try {
         recognitionRef.current.abort();
       } catch {
-        // ignore
+        // ignore abort errors if not started
       }
+      isRecognizingRef.current = false;
     }
   };
 
-  // Start Call Session
-  const startCall = () => {
-    speechCtrl.stop();
-    setCallActive(true);
-    setTurns([]);
-    setCallMemory({});
-    setBargeInCount(0);
-    setHumanHandoffNotice(null);
-    setSwitchedNotice(null);
+  // Cleanup recognition, timers, and TTS on unmount
+  useEffect(() => {
+    isUnmountedRef.current = false;
+    return () => {
+      isUnmountedRef.current = true;
+      shouldListenRef.current = false;
+      isSpeakingTtsRef.current = false;
+      clearRestartTimer();
+      turnAbortRef.current?.abort();
+      speechCtrl.stop();
 
-    const greetingText = tenant.greetings[tenant.defaultLanguage] || tenant.greetings.en;
+      const rec = recognitionRef.current;
+      if (rec) {
+        rec.onstart = null;
+        rec.onresult = null;
+        rec.onerror = null;
+        rec.onend = null;
+        try {
+          rec.abort();
+        } catch {
+          // ignore
+        }
+        recognitionRef.current = null;
+      }
+      isRecognizingRef.current = false;
+    };
+  }, [speechCtrl]);
+
+  const initCallSessionState = () => {
+    const activeTenant = tenantRef.current;
+    turnAbortRef.current?.abort();
+    speechCtrl.stop();
+    fatalMicErrorRef.current = false;
+    consecutiveErrorsRef.current = 0;
+    setMicErrorNotice(null);
+    setTurnErrorNotice(null);
+    setIsProcessingTurn(false);
+
+    updateCallActive(true);
+    updateActiveLanguage(activeTenant.defaultLanguage);
+    updateCallMemory({});
+    bargeInCountRef.current = 0;
+    setBargeInCount(0);
+    updateHumanHandoff(null);
+    updateLastLatency(null);
+    setSwitchedNotice(null);
+    callDurationRef.current = 0;
+    setCallDuration(0);
+
+    const greetingText =
+      activeTenant.greetings[activeTenant.defaultLanguage] || activeTenant.greetings.en;
     const initialTurn: CallTurn = {
       id: `turn_${Date.now()}`,
       speaker: 'agent',
       text: greetingText,
-      language: tenant.defaultLanguage,
+      language: activeTenant.defaultLanguage,
       timestamp: Date.now(),
     };
 
-    setTurns([initialTurn]);
+    updateTurns([initialTurn]);
+    return { activeTenant, greetingText };
+  };
+
+  // Start Call Session
+  const startCall = () => {
+    const { activeTenant, greetingText } = initCallSessionState();
     setOrbState('speaking');
     isSpeakingTtsRef.current = true;
+    stopListeningMic();
 
     // AI Disclosure at start of call
     speechCtrl.speak(
       greetingText,
-      tenant.defaultLanguage,
+      activeTenant.defaultLanguage,
       () => {
+        if (isUnmountedRef.current || !callActiveRef.current) return;
         isSpeakingTtsRef.current = false;
         setOrbState('listening');
         startListeningMic();
       },
-      { speed: tenant.voicePersona.speed, pitch: tenant.voicePersona.pitch }
+      { speed: activeTenant.voicePersona.speed, pitch: activeTenant.voicePersona.pitch }
     );
   };
 
   // End Call Session
   const endCall = () => {
+    turnAbortRef.current?.abort();
     speechCtrl.stop();
     isSpeakingTtsRef.current = false;
+    setIsProcessingTurn(false);
     stopListeningMic();
-    setCallActive(false);
+    updateCallActive(false);
     setOrbState('idle');
     setCurrentInterimSpeech('');
 
     const currentTurns = turnsRef.current;
-    if (currentTurns.length > 1 && onCallEnded) {
-      const avgLat = lastLatency?.totalTurnaroundMs || 750;
+    const activeTenant = tenantRef.current;
+    const endCallback = onCallEndedRef.current;
+
+    if (currentTurns.length > 1 && endCallback) {
+      const avgLat = lastLatencyRef.current?.totalTurnaroundMs || 750;
+      const handoffReason = humanHandoffRef.current;
+      const capturedMemory = { ...callMemoryRef.current };
+
       const callRecord = {
         id: `call_${Date.now()}`,
-        tenantId: tenant.id,
-        tenantName: tenant.name,
-        callerNumber: callMemoryRef.current.phone || 'Web Voice Session',
-        callerName: callMemoryRef.current.patientName || 'Web Caller',
+        tenantId: activeTenant.id,
+        tenantName: activeTenant.name,
+        callerNumber: capturedMemory.phone || 'Web Voice Session',
+        callerName: capturedMemory.patientName || 'Web Caller',
         startedAt: new Date().toLocaleTimeString(),
-        durationSeconds: callDuration,
+        durationSeconds: callDurationRef.current,
         languagesUsed: Array.from(new Set(currentTurns.map(t => t.language))),
         detectedIntent: currentTurns.find(t => t.toolInvoked)?.toolInvoked?.toolName || 'general_inquiry',
         turns: currentTurns,
@@ -253,13 +480,13 @@ export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({ tenant, onCallEnde
         metrics: {
           averageLatencyMs: avgLat,
           p95LatencyMs: Math.round(avgLat * 1.15),
-          bargeInCount,
+          bargeInCount: bargeInCountRef.current,
           toolsExecutedCount: currentTurns.filter(t => t.toolInvoked).length,
-          taskCompleted: !humanHandoffNotice,
-          handedOffToHuman: Boolean(humanHandoffNotice),
-          satisfactionScore: humanHandoffNotice ? 3 : 5,
+          taskCompleted: !handoffReason,
+          handedOffToHuman: Boolean(handoffReason),
+          satisfactionScore: handoffReason ? 3 : 5,
         },
-        capturedMemory: callMemoryRef.current,
+        capturedMemory,
       };
 
       // Persist to server SQLite
@@ -269,7 +496,7 @@ export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({ tenant, onCallEnde
         body: JSON.stringify(callRecord),
       }).catch(err => console.warn('Failed to persist call log:', err));
 
-      onCallEnded(callRecord);
+      endCallback(callRecord);
     }
   };
 
@@ -277,14 +504,15 @@ export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({ tenant, onCallEnde
   const triggerBargeIn = () => {
     speechCtrl.stop();
     isSpeakingTtsRef.current = false;
-    setBargeInCount(c => c + 1);
+    bargeInCountRef.current += 1;
+    setBargeInCount(bargeInCountRef.current);
     setOrbState('interrupted');
 
-    setTurns(prev => {
+    updateTurns(prev => {
       const copy = [...prev];
       for (let i = copy.length - 1; i >= 0; i--) {
         if (copy[i].speaker === 'agent') {
-          copy[i].interrupted = true;
+          copy[i] = { ...copy[i], interrupted: true };
           break;
         }
       }
@@ -292,6 +520,7 @@ export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({ tenant, onCallEnde
     });
 
     setTimeout(() => {
+      if (isUnmountedRef.current || !callActiveRef.current) return;
       setOrbState('listening');
       startListeningMic();
     }, 250);
@@ -299,9 +528,10 @@ export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({ tenant, onCallEnde
 
   // Handle User Input (Spoken or Typed)
   const handleUserSpoke = async (rawText: string) => {
-    if (!rawText.trim()) return;
+    if (!rawText.trim() || isUnmountedRef.current) return;
 
     const tStart = performance.now();
+    const activeTenant = tenantRef.current;
     const currentLang = activeLanguageRef.current;
     const currentMem = callMemoryRef.current;
     const currentTurns = turnsRef.current;
@@ -314,173 +544,152 @@ export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({ tenant, onCallEnde
       timestamp: Date.now(),
     };
 
-    setTurns(prev => [...prev, userTurn]);
+    const nextTurnsAfterUser = [...currentTurns, userTurn];
+    updateTurns(nextTurnsAfterUser);
+    setIsProcessingTurn(true);
     setOrbState('processing');
+    setTurnErrorNotice(null);
 
-    // Call server /api/turn endpoint
+    // Abort any superseded in-flight request to guarantee transcript ordering
+    turnAbortRef.current?.abort();
+    const controller = new AbortController();
+    turnAbortRef.current = controller;
+
+    // Call server /api/turn endpoint for genuine Gemini answer generation
     try {
       const res = await fetch('/api/turn', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
         body: JSON.stringify({
-          tenantId: tenant.id,
+          tenantId: activeTenant.id,
           userText: rawText,
           language: currentLang,
           memory: currentMem,
-          history: currentTurns,
+          history: nextTurnsAfterUser,
         }),
       });
 
-      if (!res.ok) throw new Error('API turn request failed');
-      const turnOutput = await res.json();
-      const measuredLatency = Math.round(performance.now() - tStart);
+      const payload = await res.json().catch(() => null);
+      if (controller.signal.aborted || isUnmountedRef.current) return;
 
-      setActiveLanguage(turnOutput.language);
-      if (turnOutput.switchedLanguage) {
-        setSwitchedNotice(`Switched to ${SUPPORTED_LANGUAGES[turnOutput.language as SupportedLanguage]?.name || turnOutput.language}`);
+      if (!res.ok || !payload || typeof payload.reply !== 'string') {
+        const errMessage =
+          payload?.error || `Server returned error status (${res.status}). Please retry.`;
+        throw new Error(errMessage);
       }
 
-      setCallMemory(turnOutput.memoryUpdates || currentMem);
-      setLastLatency({
-        vadMs: turnOutput.latencyBreakdown?.vadMs || 15,
-        sttMs: turnOutput.latencyBreakdown?.sttMs || 25,
-        ragMs: turnOutput.latencyBreakdown?.ragMs || 10,
-        llmFirstTokenMs: turnOutput.latencyBreakdown?.llmFirstTokenMs || Math.max(30, measuredLatency - 50),
+      const measuredLatency = Math.round(performance.now() - tStart);
+      const nextLang = (payload.language || currentLang) as SupportedLanguage;
+
+      updateActiveLanguage(nextLang);
+      if (payload.switchedLanguage) {
+        setSwitchedNotice(
+          `Switched to ${SUPPORTED_LANGUAGES[nextLang]?.name || nextLang}`
+        );
+      }
+
+      updateCallMemory(payload.memoryUpdates || currentMem);
+      updateLastLatency({
+        vadMs: payload.latencyBreakdown?.vadMs || 15,
+        sttMs: payload.latencyBreakdown?.sttMs || 25,
+        ragMs: payload.latencyBreakdown?.ragMs || 10,
+        llmFirstTokenMs:
+          payload.latencyBreakdown?.llmFirstTokenMs || Math.max(30, measuredLatency - 50),
         ttsFirstAudioMs: 15,
         totalTurnaroundMs: measuredLatency,
       });
 
-      if (turnOutput.shouldHandoff) {
-        setHumanHandoffNotice(turnOutput.handoffReason || 'Escalation transfer requested');
+      if (payload.shouldHandoff) {
+        updateHumanHandoff(payload.handoffReason || 'Escalation transfer requested');
       }
 
       const agentTurn: CallTurn = {
         id: `turn_${Date.now()}_a`,
         speaker: 'agent',
-        text: turnOutput.reply,
-        language: turnOutput.language,
+        text: payload.reply,
+        language: nextLang,
         timestamp: Date.now(),
         latencyMs: measuredLatency,
-        toolInvoked: turnOutput.toolCalls?.[0]
+        toolInvoked: payload.toolCalls?.[0]
           ? {
-              toolName: turnOutput.toolCalls[0].name,
+              toolName: payload.toolCalls[0].name,
               params: {},
-              result: turnOutput.toolCalls[0].result,
+              result: payload.toolCalls[0].result,
             }
           : undefined,
       };
 
-      setTurns(prev => [...prev, agentTurn]);
+      setIsProcessingTurn(false);
+      updateTurns(prev => [...prev, agentTurn]);
       setOrbState('speaking');
       isSpeakingTtsRef.current = true;
       stopListeningMic();
 
       speechCtrl.speak(
-        turnOutput.reply,
-        turnOutput.language as SupportedLanguage,
+        payload.reply,
+        nextLang,
         () => {
+          if (isUnmountedRef.current || !callActiveRef.current) return;
           isSpeakingTtsRef.current = false;
           setOrbState('listening');
           startListeningMic();
         },
-        { speed: tenant.voicePersona.speed, pitch: tenant.voicePersona.pitch }
+        { speed: activeTenant.voicePersona.speed, pitch: activeTenant.voicePersona.pitch }
       );
-    } catch {
-      // Fallback to client-side pipeline
-      const fallback = processTurn({
-        userInput: rawText,
-        tenant,
-        currentLanguage: currentLang,
-        callMemory: currentMem,
-        turnHistory: currentTurns,
-      });
+    } catch (err: any) {
+      if (controller.signal.aborted || err?.name === 'AbortError' || isUnmountedRef.current) return;
 
-      const measuredLatency = Math.round(performance.now() - tStart);
-      setActiveLanguage(fallback.detectedLanguage);
-      setCallMemory(fallback.updatedMemory);
-      setLastLatency({
-        ...fallback.latencyBreakdown,
-        totalTurnaroundMs: measuredLatency,
-      });
+      setIsProcessingTurn(false);
+      const message =
+        err instanceof Error && err.message
+          ? err.message
+          : 'Unable to reach the AI response server. Please check your connection and retry.';
+      setTurnErrorNotice({ message, retryText: rawText });
 
-      if (fallback.shouldHandoff) {
-        setHumanHandoffNotice(fallback.handoffReason || 'Escalated to human supervisor');
+      isSpeakingTtsRef.current = false;
+      if (callActiveRef.current) {
+        setOrbState('listening');
+        if (!isMutedRef.current) {
+          startListeningMic();
+        }
+      } else {
+        setOrbState('idle');
       }
-
-      const agentTurn: CallTurn = {
-        id: `turn_${Date.now()}_a`,
-        speaker: 'agent',
-        text: fallback.spokenReply,
-        language: fallback.detectedLanguage,
-        timestamp: Date.now(),
-        latencyMs: measuredLatency,
-        fillerUsed: fallback.fillerUsed,
-        toolInvoked: fallback.toolResult
-          ? {
-              toolName: fallback.toolInvokedName || 'tool',
-              params: {},
-              result: fallback.toolResult,
-            }
-          : undefined,
-      };
-
-      setTurns(prev => [...prev, agentTurn]);
-      setOrbState('speaking');
-      isSpeakingTtsRef.current = true;
-      stopListeningMic();
-
-      speechCtrl.speak(
-        fallback.spokenReply,
-        fallback.detectedLanguage,
-        () => {
-          isSpeakingTtsRef.current = false;
-          setOrbState('listening');
-          startListeningMic();
-        },
-        { speed: tenant.voicePersona.speed, pitch: tenant.voicePersona.pitch }
-      );
     }
   };
 
-  const handleScenarioClick = (text: string) => {
-    if (!callActive) {
-      speechCtrl.stop();
-      setCallActive(true);
-      setTurns([]);
-      setCallMemory({});
-      setBargeInCount(0);
-      setHumanHandoffNotice(null);
+  // Keep handleUserSpokeRef pointing to the latest implementation on every render
+  handleUserSpokeRef.current = handleUserSpoke;
 
-      const greetingText = tenant.greetings[tenant.defaultLanguage] || tenant.greetings.en;
-      const initialTurn: CallTurn = {
-        id: `turn_${Date.now()}`,
-        speaker: 'agent',
-        text: greetingText,
-        language: tenant.defaultLanguage,
-        timestamp: Date.now(),
-      };
-      setTurns([initialTurn]);
+  const handleScenarioClick = (text: string) => {
+    if (isProcessingTurn) return;
+    if (!callActiveRef.current) {
+      initCallSessionState();
     }
-    handleUserSpoke(text);
+    handleUserSpokeRef.current(text);
   };
 
   const handleTextSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!textInput.trim()) return;
+    if (!textInput.trim() || isProcessingTurn) return;
     const q = textInput;
     setTextInput('');
-    if (!callActive) {
-      startCall();
+    if (!callActiveRef.current) {
+      initCallSessionState();
     }
-    handleUserSpoke(q);
+    handleUserSpokeRef.current(q);
   };
 
   const toggleMute = () => {
-    const nextMuted = !isMuted;
-    setIsMuted(nextMuted);
+    const nextMuted = !isMutedRef.current;
+    updateIsMuted(nextMuted);
     if (nextMuted) {
       stopListeningMic();
     } else {
+      fatalMicErrorRef.current = false;
+      consecutiveErrorsRef.current = 0;
+      setMicErrorNotice(null);
       startListeningMic();
     }
   };
@@ -502,6 +711,44 @@ export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({ tenant, onCallEnde
           <div className="text-xs text-slate-300 leading-relaxed">
             {odiaWarning}
           </div>
+        </div>
+      )}
+
+      {/* Microphone Permission or Error Notice */}
+      {(!micSupported || micErrorNotice) && (
+        <div
+          role="status"
+          className="bg-rose-950/30 border border-rose-500/30 rounded-2xl p-3.5 flex items-start gap-3"
+        >
+          <ShieldAlert className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+          <div className="text-xs text-rose-200 leading-relaxed">
+            {micErrorNotice ||
+              'Browser speech recognition is unavailable in this environment. You can test the full voice pipeline using typed input or 1-click prompts below.'}
+          </div>
+        </div>
+      )}
+
+      {/* Server AI Generation Error Banner (never silently masked) */}
+      {turnErrorNotice && (
+        <div
+          role="alert"
+          className="bg-rose-950/40 border border-rose-500/40 rounded-2xl p-3.5 flex items-center justify-between gap-3"
+        >
+          <div className="flex items-start gap-3">
+            <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+            <div className="text-xs text-rose-200 leading-relaxed">
+              {turnErrorNotice.message}
+            </div>
+          </div>
+          {turnErrorNotice.retryText && (
+            <button
+              onClick={() => handleUserSpokeRef.current(turnErrorNotice.retryText!)}
+              className="px-3 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-500 text-white font-semibold text-xs flex items-center gap-1.5 shrink-0 cursor-pointer"
+            >
+              <RotateCcw className="w-3.5 h-3.5" />
+              <span>Retry</span>
+            </button>
+          )}
         </div>
       )}
 
@@ -768,10 +1015,11 @@ export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({ tenant, onCallEnde
               />
               <button
                 type="submit"
+                disabled={isProcessingTurn || !textInput.trim()}
                 aria-label="Send message"
-                className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs transition-colors cursor-pointer"
+                className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white font-semibold text-xs transition-colors cursor-pointer"
               >
-                Send
+                {isProcessingTurn ? 'Thinking...' : 'Send'}
               </button>
             </form>
           </div>

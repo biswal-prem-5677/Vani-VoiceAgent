@@ -1,4 +1,4 @@
-import { SupportedLanguage } from '../types';
+import type { SupportedLanguage } from '../types/index.ts';
 
 export interface EmergencyCheckResult {
   isEmergency: boolean;
@@ -26,10 +26,13 @@ const EMERGENCY_PATTERNS = [
 ];
 
 /**
- * Whole-word and exact token matches for human escalation/frustration.
- * Avoids substring bugs (e.g., 'humanities' matching 'human').
+ * Whole-word and phrase matches for human escalation/frustration.
+ * Avoids substring bugs ('humanities' matching 'human') and avoids
+ * false-positive escalation when customers simply ask about "AI agent" capabilities
+ * or staff titles without asking to transfer or speak to someone.
  */
-const HUMAN_ESCALATION_REGEX = /\b(angry|human|agent|manager|officer|useless|stupid|bakwas|insan|gussa|kharap|supervisor|talk\s+to\s+(?:a\s+)?person)\b/i;
+const HUMAN_ESCALATION_REGEX =
+  /\b(angry|human|supervisor|useless|stupid|bakwas|insan|gussa|kharap)\b|\b(?:talk|speak|connect|transfer|forward|escalate|hand\s*over|pass)\s+(?:me\s+)?(?:to|with)\s+(?:a\s+|an\s+|the\s+|your\s+)?(?:real\s+)?(?:person|human|agent|manager|officer|representative|staff|specialist)\b|\b(?:call|need|want)\s+(?:a\s+|an\s+|the\s+)?(?:manager|supervisor|human\s+agent|real\s+person)\b/i;
 const HUMAN_ESCALATION_INDIC_TOKENS = [
   'କଥା ହେବି', 'ମ୍ୟାନେଜର', 'ଅଧିକାରୀ', 'ବରିଷ୍ଠ', 'ରାଗ',
   'बात कराओ', 'इंसान से बात', 'अधिकारी', 'गुस्सा',

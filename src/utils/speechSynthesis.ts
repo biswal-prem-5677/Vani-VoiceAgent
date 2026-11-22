@@ -1,4 +1,4 @@
-import { SupportedLanguage } from '../types';
+import type { SupportedLanguage } from '../types/index.ts';
 
 export interface SpeechOptions {
   speed?: number;

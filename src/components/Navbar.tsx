@@ -49,20 +49,20 @@ export const Navbar: React.FC<NavbarProps> = ({
   const [tenantDropdownOpen, setTenantDropdownOpen] = useState(false);
 
   const navItems = [
-    { id: 'call' as ActiveTab, label: 'Live Voice Console', icon: PhoneCall },
-    { id: 'knowledge' as ActiveTab, label: 'Knowledge Base & RAG', icon: BookOpen },
-    { id: 'voice' as ActiveTab, label: 'Voice & Tool Engine', icon: Sliders },
+    { id: 'call' as ActiveTab, label: 'Voice Console', icon: PhoneCall },
+    { id: 'knowledge' as ActiveTab, label: 'Knowledge Base', icon: BookOpen },
+    { id: 'voice' as ActiveTab, label: 'Voice & Tools', icon: Sliders },
     { id: 'logs' as ActiveTab, label: 'Call Transcripts', icon: FileText },
-    { id: 'eval' as ActiveTab, label: 'Test & Evaluation Harness', icon: Award },
-    { id: 'widget' as ActiveTab, label: 'Web Widget Embed', icon: Code },
+    { id: 'eval' as ActiveTab, label: 'Eval Harness', icon: Award },
+    { id: 'widget' as ActiveTab, label: 'Web Widget', icon: Code },
   ];
 
   return (
     <header className="sticky top-0 z-40 bg-[#080B10]/95 backdrop-blur-xl border-b border-white/[0.08]">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-        <div className="flex items-center justify-between h-16 gap-6">
+        <div className="flex items-center justify-between h-16 gap-3">
           {/* Zone 1: Single Wordmark Brand */}
-          <div className="flex items-center gap-3 shrink-0">
+          <div className="flex items-center gap-2.5 shrink-0">
             <div className="w-9 h-9 rounded-xl bg-gradient-to-tr from-emerald-500 via-teal-400 to-indigo-600 flex items-center justify-center shadow-lg shadow-emerald-500/20 text-white font-black text-base tracking-wider">
               V
             </div>
@@ -70,14 +70,14 @@ export const Navbar: React.FC<NavbarProps> = ({
               <span className="font-extrabold text-base text-white tracking-tight block">
                 VaniVoice AI
               </span>
-              <span className="text-[11px] text-slate-400 font-mono tracking-tight hidden sm:block">
+              <span className="text-[11px] text-slate-400 font-mono tracking-tight hidden xl:block">
                 Multilingual Voice Prototype
               </span>
             </div>
           </div>
 
           {/* Zone 2: Navigation Links */}
-          <nav className="hidden lg:flex items-center gap-1 bg-[#0F141F] p-1 rounded-xl border border-white/[0.06]">
+          <nav className="hidden lg:flex items-center gap-0.5 bg-[#0F141F] p-1 rounded-xl border border-white/[0.06]">
             {navItems.map(item => {
               const Icon = item.icon;
               const isActive = activeTab === item.id;
@@ -85,7 +85,7 @@ export const Navbar: React.FC<NavbarProps> = ({
                 <button
                   key={item.id}
                   onClick={() => onSelectTab(item.id)}
-                  className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-medium whitespace-nowrap transition-all ${
+                  className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium whitespace-nowrap transition-all cursor-pointer ${
                     isActive
                       ? 'bg-white/10 text-white shadow-sm font-semibold'
                       : 'text-slate-400 hover:text-slate-200 hover:bg-white/[0.04]'

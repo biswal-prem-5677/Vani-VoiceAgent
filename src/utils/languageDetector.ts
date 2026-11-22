@@ -1,4 +1,4 @@
-import { SupportedLanguage, LanguageMeta } from '../types';
+import type { SupportedLanguage, LanguageMeta } from '../types/index.ts';
 
 export const SUPPORTED_LANGUAGES: Record<SupportedLanguage, LanguageMeta> = {
   or: {
@@ -50,7 +50,7 @@ const BENGALI_REGEX = /[\u0980-\u09FF]/;
 const ODIA_ROMAN_KEYWORDS = [
   'namaskar', 'aagya', 'agya', 'kemiti', 'achhanti', 'achanti', 'dharantu',
   'mu', 'mote', 'apana', 'tume', 'ebe', 'tike', 'tikie', 'dekhantu', 'karantu',
-  'chahunchi', 'dr', 'daktara', 'ausadha', 'au', 'taha', 'janantu', 'bhubaneswar',
+  'chahunchi', 'daktara', 'ausadha', 'au', 'taha', 'janantu', 'bhubaneswar',
   'cuttack', 'dhanyabad', 'kete', 'bele', 'kahinki', 'auki', 'aukie'
 ];
 
