@@ -1,10 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert';
-import { detectLanguage } from './languageDetector';
-import { searchKnowledgeBase, RELEVANCE_THRESHOLD, extractRelevantSentences } from './ragEngine';
-import { executeTenantTool } from './tools';
-import { checkEmergencyCondition, checkHumanEscalationRequest } from './safety';
-import { extractEntitiesFromInput, processTurn } from './callPipeline';
+import { detectLanguage } from './languageDetector.ts';
+import { searchKnowledgeBase, RELEVANCE_THRESHOLD } from './ragEngine.ts';
+import { executeTenantTool } from './tools.ts';
+import {
+  checkEmergencyCondition,
+  checkHumanEscalationRequest,
+  buildHumanEscalationReply,
+} from './safety.ts';
+import { extractEntitiesFromInput, processTurn } from './callPipeline.ts';
 import { calculatePercentiles } from './latencyTracker.ts';
 import {
   isFatalRecognitionError,
@@ -19,27 +23,57 @@ import {
   buildGeminiToolDeclarations,
   extractMemoryUpdatesFromToolCall,
 } from './geminiTurnBuilder.ts';
+import {
+  hashPassword,
+  verifyPassword,
+  signSessionToken,
+  verifySessionToken,
+  canAccessTenant,
+} from './auth.ts';
+import {
+  ConsentRequestSchema,
+  TurnRequestSchema,
+} from './schemas.ts';
 import { INITIAL_TENANTS } from '../data/tenants.ts';
 
 const clinicTenant = INITIAL_TENANTS[0];
+const logisticsTenant = INITIAL_TENANTS.find(t => t.id === 'konark_logistics') || INITIAL_TENANTS[2];
 
-test('Safety: Emergency detection correctly flags Odia chest pain and advises 112', () => {
+test('Safety: Emergency detection correctly flags Odia chest pain and advises 112 with tenant contact', () => {
   const input = 'ମୋ ବାପାଙ୍କର ଛାତିରେ ବହୁତ କଷ୍ଟ ହେଉଛି! ଶୀଘ୍ର ସାହାଯ୍ୟ କରନ୍ତୁ!';
-  const result = checkEmergencyCondition(input, 'or');
+  const result = checkEmergencyCondition(input, 'or', clinicTenant, 'HND-123456');
   assert.ok(result !== null, 'Emergency should be detected');
   assert.strictEqual(result.isEmergency, true);
   assert.ok(result.emergencyMessage.includes('୧୧୨'), 'Should instruct to dial 112 in Odia');
-  assert.ok(result.actionRequired.includes('Duty Medical Officer'));
+  assert.ok(result.emergencyMessage.includes('HND-123456'), 'Should include callback ticket ID');
+  assert.ok(result.actionRequired.includes('Dial 112 immediately'));
+});
+
+test('Safety: Emergency detection on non-clinic tenant clarifies non-medical role and uses tenant desk', () => {
+  const input = 'My father is having severe chest pain right now!';
+  const result = checkEmergencyCondition(input, 'en', logisticsTenant, 'HND-999111');
+  assert.ok(result !== null);
+  assert.ok(result.emergencyMessage.includes('112'));
+  assert.ok(result.emergencyMessage.includes('not a medical facility'));
+  assert.ok(result.emergencyMessage.includes(logisticsTenant.humanHandoffContact.department));
+  assert.ok(!result.actionRequired.includes('Duty Medical Officer'));
+});
+
+test('Safety: Human escalation creates honest callback queue response without false live bridge claims', () => {
+  const reply = buildHumanEscalationReply('en', logisticsTenant, 'HND-555000');
+  assert.ok(reply.includes('HND-555000'));
+  assert.ok(reply.includes('does not bridge live phone lines directly'));
+  assert.ok(reply.includes(logisticsTenant.humanHandoffContact.department));
 });
 
 test('Safety: Emergency detection flags Hindi and English critical symptoms', () => {
   const hindiInput = 'मरीज को सांस नहीं आ रही है और बेहोश हो गए हैं!';
-  const hindiResult = checkEmergencyCondition(hindiInput, 'hi');
+  const hindiResult = checkEmergencyCondition(hindiInput, 'hi', clinicTenant);
   assert.ok(hindiResult !== null);
   assert.strictEqual(hindiResult.isEmergency, true);
 
   const englishInput = 'My father is having severe chest pain and cannot breathe!';
-  const englishResult = checkEmergencyCondition(englishInput, 'en');
+  const englishResult = checkEmergencyCondition(englishInput, 'en', clinicTenant);
   assert.ok(englishResult !== null);
   assert.strictEqual(englishResult.isEmergency, true);
   assert.ok(englishResult.emergencyMessage.includes('112'));
@@ -77,6 +111,23 @@ test('Substring bug fix: "human" does NOT match inside "humanities" and informat
 
   const realEscalation = checkHumanEscalationRequest('I want to speak with a human agent please');
   assert.strictEqual(realEscalation, true, 'Whole-word "human" or escalation verb must trigger escalation');
+});
+
+test('Pipeline: Offline demo turn measures honest timing without synthetic VAD/STT constants', () => {
+  const lang = detectLanguage('What is the OPD consultation fee?', 'en');
+  assert.strictEqual(lang.detected, 'en');
+
+  const output = processTurn({
+    userInput: 'What is the OPD consultation fee?',
+    tenant: clinicTenant,
+    currentLanguage: 'en',
+    callMemory: {},
+    turnHistory: [],
+  });
+  assert.strictEqual(output.latencyBreakdown.mode, 'offline_demo');
+  assert.strictEqual(output.latencyBreakdown.vadMs, undefined);
+  assert.strictEqual(output.latencyBreakdown.sttMs, undefined);
+  assert.ok(output.latencyBreakdown.totalTurnaroundMs >= 1);
 });
 
 test('Tools: book_appointment fails when required parameters are missing', () => {
@@ -141,7 +192,6 @@ test('Retrieval: Cross-lingual query matches fee policy and returns whole senten
   assert.ok(results.length > 0, 'Should match clinic fee policy chunk');
   assert.ok(results[0].chunk.title.includes('Fees'));
   assert.ok(results[0].excerpt.includes('₹500'));
-  // Ensure excerpt is not a raw chopped slice ending in mid-word
   assert.ok(results[0].excerpt.includes('.'), 'Sentence excerpt should contain complete sentence punctuation');
 });
 
@@ -207,7 +257,7 @@ test('Gemini Turn Builder: Uses gemini-4-hydrogen and builds deduplicated multi-
   assert.ok(contents.some(c => c.role === 'model' && c.parts?.[0]?.text?.includes('Dr. Jena')));
 });
 
-test('Gemini Turn Builder: Includes full tenant KB, instructions against scripted replies, and tool schemas', () => {
+test('Gemini Turn Builder: Includes full tenant KB, instructions against scripted replies, tool schemas, and truncates huge digests', () => {
   const instruction = buildTenantSystemInstruction({
     tenant: clinicTenant,
     activeLang: 'en',
@@ -220,6 +270,28 @@ test('Gemini Turn Builder: Includes full tenant KB, instructions against scripte
   assert.ok(instruction.includes('Consultation Fees & Payment'));
   assert.ok(instruction.includes('NEVER output robotic, repetitive, or canned/scripted phrasing'));
   assert.ok(instruction.includes('Dr. Jena (Cardiology)'));
+
+  const largeTenant = {
+    ...clinicTenant,
+    knowledgeBase: Array.from({ length: 12 }, (_, idx) => ({
+      id: `big_${idx}`,
+      title: `Large Doc ${idx}`,
+      category: 'Policy',
+      content: 'X'.repeat(900),
+      tags: ['policy'],
+      addedAt: '2026-11-24',
+    })),
+  };
+  const largeInstruction = buildTenantSystemInstruction({
+    tenant: largeTenant,
+    activeLang: 'en',
+    ragResults: [],
+    memory: {},
+  });
+  assert.ok(
+    largeInstruction.includes('Additional documents truncated'),
+    'Oversized KB digests should truncate cleanly within 4000 chars'
+  );
 
   const decls = buildGeminiToolDeclarations(clinicTenant.tools);
   const aptDecl = decls.find(d => d.name === 'book_appointment');
@@ -240,4 +312,82 @@ test('Gemini Turn Builder: Includes full tenant KB, instructions against scripte
   assert.strictEqual(updatedMem.bookingRef, 'KAL-APT-1234');
   assert.strictEqual(updatedMem.patientName, 'Rajesh');
   assert.strictEqual(updatedMem.pendingBooking, undefined);
+});
+
+test('Auth & RBAC: Salted scrypt hashing, signed tokens, tampering rejection, and tenant scoping', () => {
+  const hash1 = hashPassword('StrongPass!2026');
+  const hash2 = hashPassword('StrongPass!2026');
+  assert.notStrictEqual(hash1, hash2, 'Each password hash must use a unique random salt');
+  assert.strictEqual(verifyPassword('StrongPass!2026', hash1), true);
+  assert.strictEqual(verifyPassword('WrongPass', hash1), false);
+
+  const secret = 'test-signing-secret-123456';
+  const token = signSessionToken(
+    {
+      sub: 'usr_1',
+      sessionId: 'sess_1',
+      email: 'admin@kalinga.in',
+      name: 'Kalinga Admin',
+      role: 'tenant_admin',
+      allowedTenants: ['kalinga_clinic'],
+    },
+    secret,
+    3600
+  );
+
+  const verified = verifySessionToken(token, secret);
+  assert.ok(verified);
+  assert.strictEqual(verified.role, 'tenant_admin');
+
+  // Tampered payload rejected
+  const tampered = token.slice(0, -4) + 'AAAA';
+  assert.strictEqual(verifySessionToken(tampered, secret), null);
+
+  // Expired token rejected
+  const expired = signSessionToken(
+    {
+      sub: 'usr_1',
+      sessionId: 'sess_1',
+      email: 'admin@kalinga.in',
+      name: 'Kalinga Admin',
+      role: 'tenant_admin',
+      allowedTenants: ['kalinga_clinic'],
+    },
+    secret,
+    -5
+  );
+  assert.strictEqual(verifySessionToken(expired, secret), null);
+
+  assert.strictEqual(canAccessTenant({ role: 'caller', allowedTenants: [] }, 'kalinga_clinic'), false);
+  assert.strictEqual(canAccessTenant({ role: 'tenant_admin', allowedTenants: ['kalinga_clinic'] }, 'kalinga_clinic'), true);
+  assert.strictEqual(canAccessTenant({ role: 'tenant_admin', allowedTenants: ['kalinga_clinic'] }, 'konark_logistics'), false);
+  assert.strictEqual(canAccessTenant({ role: 'super_admin', allowedTenants: ['*'] }, 'konark_logistics'), true);
+});
+
+test('Validation Schemas: Enforces zero-retention consent (0 days) and turn payload limits', () => {
+  const zeroConsent = ConsentRequestSchema.safeParse({
+    consented: false,
+    retentionDays: 0,
+    tenantId: 'kalinga_clinic',
+  });
+  assert.strictEqual(zeroConsent.success, true);
+  if (zeroConsent.success) {
+    assert.strictEqual(zeroConsent.data.retentionDays, 0);
+  }
+
+  const invalidConsentDays = ConsentRequestSchema.safeParse({
+    consented: true,
+    retentionDays: 14,
+  });
+  assert.strictEqual(invalidConsentDays.success, false);
+
+  const hugeHistory = TurnRequestSchema.safeParse({
+    tenantId: 'kalinga_clinic',
+    userText: 'Hello',
+    history: Array.from({ length: 30 }, (_, i) => ({
+      speaker: i % 2 === 0 ? 'user' : 'agent',
+      text: 'msg',
+    })),
+  });
+  assert.strictEqual(hugeHistory.success, false);
 });

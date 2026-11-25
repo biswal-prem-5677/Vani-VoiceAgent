@@ -2,7 +2,11 @@ import type { SupportedLanguage, TenantConfig, CallTurn, LatencyBreakdown } from
 import { detectLanguage } from './languageDetector.ts';
 import { searchKnowledgeBase, RELEVANCE_THRESHOLD } from './ragEngine.ts';
 import { executeTenantTool } from './tools.ts';
-import { checkEmergencyCondition, checkHumanEscalationRequest } from './safety.ts';
+import {
+  checkEmergencyCondition,
+  checkHumanEscalationRequest,
+  buildHumanEscalationReply,
+} from './safety.ts';
 
 export interface ProcessTurnInput {
   userInput: string;
@@ -106,17 +110,14 @@ export function processTurn(input: ProcessTurnInput): ProcessTurnOutput {
   const startTurnTimestamp = performance.now();
 
   // 1. Language Detection & Mid-call Switch
-  const tLang0 = performance.now();
   const langAnalysis = detectLanguage(userInput, currentLanguage);
   const activeLang = langAnalysis.detected;
   const switched = langAnalysis.switched;
-  const vadMs = Math.max(8, Math.round(performance.now() - tLang0));
 
-  // 2. Safety: Emergency Condition Check (Clinic/Medical Tenant Priority)
-  const tSafety0 = performance.now();
-  const emergency = checkEmergencyCondition(userInput, activeLang);
+  // 2. Safety: Emergency Condition Check (Tenant-aware routing)
+  const emergency = checkEmergencyCondition(userInput, activeLang, tenant);
   if (emergency) {
-    const elapsedMs = Math.round(performance.now() - startTurnTimestamp);
+    const elapsedMs = Math.max(1, Math.round(performance.now() - startTurnTimestamp));
     return {
       spokenReply: emergency.emergencyMessage,
       detectedLanguage: activeLang,
@@ -127,15 +128,14 @@ export function processTurn(input: ProcessTurnInput): ProcessTurnOutput {
       updatedMemory: {
         ...callMemory,
         emergencyReported: emergency.symptomDetected || 'Critical symptom detected',
-        escalationStatus: 'Transfer requested to Duty Medical Officer',
+        escalationStatus: 'Emergency callback queued',
       },
       latencyBreakdown: {
-        vadMs,
-        sttMs: 18,
-        ragMs: 5,
-        llmFirstTokenMs: Math.max(25, elapsedMs),
-        ttsFirstAudioMs: 15,
-        totalTurnaroundMs: Math.max(65, elapsedMs),
+        ragMs: 0,
+        modelResponseMs: elapsedMs,
+        totalTurnaroundMs: elapsedMs,
+        mode: 'safety_fastpath',
+        streaming: false,
       },
       detectedIntent: 'emergency_medical',
     };
@@ -144,33 +144,24 @@ export function processTurn(input: ProcessTurnInput): ProcessTurnOutput {
   // 3. Safety: Human Escalation / Frustration Check (Whole-word)
   const wantsHuman = checkHumanEscalationRequest(userInput);
   if (wantsHuman) {
-    const handoffMsg: Record<SupportedLanguage, string> = {
-      or: 'ମୁଁ ବୁଝିପାରୁଛି ଆପଣ ବରିଷ୍ଠ ଅଧିକାରୀଙ୍କ ସହ କଥା ହେବାକୁ ଚାହୁଁଛନ୍ତି। ମୁଁ ତୁରନ୍ତ ଟ୍ରାନ୍ସଫର ରିକ୍ୱେଷ୍ଟ ପଠାଉଛି, ଲାଇନରେ ରୁହନ୍ତୁ।',
-      hi: 'मैं आपकी बात समझ रहा हूँ। मैं आपकी कॉल हमारे कस्टमर सपोर्ट अधिकारी को ट्रांसफर करने का अनुरोध भेज रहा हूँ।',
-      hinglish: 'Understood. Main turant hamare senior specialist ko transfer request forward kar raha hoon. Please hold on.',
-      bn: 'আমি বুঝতে পারছি আপনি কর্মকর্তার সাথে কথা বলতে চান। আমি এখনই ট্রান্সফার রিকোয়েস্ট পাঠাচ্ছি।',
-      en: 'I understand you would like to speak to a person. I am submitting an urgent transfer request to our staff specialist right now. Please hold on.',
-    };
-
-    const elapsedMs = Math.round(performance.now() - startTurnTimestamp);
+    const elapsedMs = Math.max(1, Math.round(performance.now() - startTurnTimestamp));
     return {
-      spokenReply: handoffMsg[activeLang] || handoffMsg.en,
+      spokenReply: buildHumanEscalationReply(activeLang, tenant),
       detectedLanguage: activeLang,
       switchedLanguage: switched,
       shouldHandoff: true,
-      handoffReason: 'Caller requested human supervisor / escalation',
+      handoffReason: `Callback requested for ${tenant.humanHandoffContact.department}`,
       updatedMemory: {
         ...callMemory,
-        escalationReason: 'Requested human agent',
-        escalationStatus: 'Transfer requested',
+        escalationReason: 'Requested human specialist',
+        escalationStatus: 'Callback queued',
       },
       latencyBreakdown: {
-        vadMs,
-        sttMs: 20,
-        ragMs: 5,
-        llmFirstTokenMs: Math.max(30, elapsedMs),
-        ttsFirstAudioMs: 15,
-        totalTurnaroundMs: Math.max(70, elapsedMs),
+        ragMs: 0,
+        modelResponseMs: elapsedMs,
+        totalTurnaroundMs: elapsedMs,
+        mode: 'safety_fastpath',
+        streaming: false,
       },
       detectedIntent: 'human_escalation',
     };
@@ -359,7 +350,7 @@ export function processTurn(input: ProcessTurnInput): ProcessTurnOutput {
   }
 
   // Calculate actual execution times
-  const totalTurnaroundMs = Math.max(45, Math.round(performance.now() - startTurnTimestamp));
+  const totalTurnaroundMs = Math.max(1, Math.round(performance.now() - startTurnTimestamp));
 
   return {
     spokenReply,
@@ -371,12 +362,11 @@ export function processTurn(input: ProcessTurnInput): ProcessTurnOutput {
     shouldHandoff: false,
     updatedMemory,
     latencyBreakdown: {
-      vadMs,
-      sttMs: 25,
       ragMs,
-      llmFirstTokenMs: Math.max(30, totalTurnaroundMs - (vadMs + ragMs + 35)),
-      ttsFirstAudioMs: 15,
+      modelResponseMs: Math.max(1, totalTurnaroundMs - ragMs),
       totalTurnaroundMs,
+      mode: 'offline_demo',
+      streaming: false,
     },
     detectedIntent,
   };

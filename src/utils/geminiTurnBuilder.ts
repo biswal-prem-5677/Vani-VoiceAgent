@@ -105,10 +105,25 @@ export function buildTenantSystemInstruction(params: {
         .join('\n')
     : 'None ranked above keyword threshold — check the complete Company Knowledge Base below and use your general domain understanding.';
 
+  const matchedIds = new Set(ragResults.map(r => r.chunk.id));
+  let digestBudget = 4000;
+  const digestLines: string[] = [];
+  for (const doc of tenant.knowledgeBase) {
+    if (matchedIds.has(doc.id)) continue;
+    const line = `- **${doc.title}** (${doc.category}): ${doc.content}`;
+    if (line.length > digestBudget) {
+      if (digestBudget > 120) {
+        digestLines.push(line.slice(0, digestBudget - 3) + '...');
+      }
+      digestLines.push('- *(Additional documents truncated; prioritized RAG matches shown above.)*');
+      break;
+    }
+    digestLines.push(line);
+    digestBudget -= line.length + 1;
+  }
+
   const fullKbDigest = tenant.knowledgeBase.length > 0
-    ? tenant.knowledgeBase
-        .map(doc => `- **${doc.title}** (${doc.category}): ${doc.content}`)
-        .join('\n')
+    ? (digestLines.length > 0 ? digestLines.join('\n') : 'All tenant documents are included in Top Relevant Knowledge Matches above.')
     : 'No uploaded documents yet for this tenant.';
 
   const langGuide = LANGUAGE_INSTRUCTIONS[activeLang] || LANGUAGE_INSTRUCTIONS.en;

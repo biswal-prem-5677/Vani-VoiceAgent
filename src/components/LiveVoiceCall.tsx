@@ -16,8 +16,15 @@ import {
   Info,
   RotateCcw,
 } from 'lucide-react';
-import { TenantConfig, SupportedLanguage, CallTurn, LatencyBreakdown } from '../types';
+import {
+  TenantConfig,
+  SupportedLanguage,
+  CallTurn,
+  LatencyBreakdown,
+  HandoffTicket,
+} from '../types';
 import { SUPPORTED_LANGUAGES } from '../utils/languageDetector';
+import { calculatePercentiles } from '../utils/latencyTracker';
 import { createSpeechController } from '../utils/speechSynthesis';
 import {
   isBenignRecognitionError,
@@ -29,10 +36,21 @@ import { AudioOrb } from './AudioOrb';
 
 interface LiveVoiceCallProps {
   tenant: TenantConfig;
-  onCallEnded?: (callRecord: any) => void;
+  authToken: string | null;
+  canPersistLogs: boolean;
+  geminiConfigured: boolean;
+  onCallEnded?: (callRecord: any, persisted: boolean) => void;
+  onHandoffCreated?: (ticket: HandoffTicket) => void;
 }
 
-export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({ tenant, onCallEnded }) => {
+export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({
+  tenant,
+  authToken,
+  canPersistLogs,
+  geminiConfigured,
+  onCallEnded,
+  onHandoffCreated,
+}) => {
   const [callActive, setCallActive] = useState<boolean>(false);
   const [callDuration, setCallDuration] = useState<number>(0);
   const [isMuted, setIsMuted] = useState<boolean>(false);
@@ -51,12 +69,22 @@ export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({ tenant, onCallEnde
   const [micSupported, setMicSupported] = useState<boolean>(true);
   const [odiaWarning, setOdiaWarning] = useState<string | null>(null);
   const [micErrorNotice, setMicErrorNotice] = useState<string | null>(null);
-  const [turnErrorNotice, setTurnErrorNotice] = useState<{ message: string; retryText?: string } | null>(null);
+  const [turnErrorNotice, setTurnErrorNotice] = useState<{
+    message: string;
+    retryText?: string;
+    canEnableDemo?: boolean;
+  } | null>(null);
   const [isProcessingTurn, setIsProcessingTurn] = useState<boolean>(false);
+  const [offlineDemoMode, setOfflineDemoMode] = useState<boolean>(!geminiConfigured);
+  const [queuedHandoffTicket, setQueuedHandoffTicket] = useState<HandoffTicket | null>(null);
 
   // Refs synced immediately with state to eliminate stale closures in SpeechRecognition and async handlers
   const tenantRef = useRef<TenantConfig>(tenant);
-  const onCallEndedRef = useRef<((callRecord: any) => void) | undefined>(onCallEnded);
+  const authTokenRef = useRef<string | null>(authToken);
+  const canPersistLogsRef = useRef<boolean>(canPersistLogs);
+  const demoModeRef = useRef<boolean>(offlineDemoMode);
+  const onCallEndedRef = useRef<((callRecord: any, persisted: boolean) => void) | undefined>(onCallEnded);
+  const onHandoffCreatedRef = useRef<((ticket: HandoffTicket) => void) | undefined>(onHandoffCreated);
   const turnsRef = useRef<CallTurn[]>(turns);
   const callMemoryRef = useRef<Record<string, string>>(callMemory);
   const activeLanguageRef = useRef<SupportedLanguage>(activeLanguage);
@@ -66,6 +94,8 @@ export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({ tenant, onCallEnde
   const bargeInCountRef = useRef<number>(bargeInCount);
   const humanHandoffRef = useRef<string | null>(humanHandoffNotice);
   const lastLatencyRef = useRef<LatencyBreakdown | null>(lastLatency);
+  const turnLatenciesRef = useRef<number[]>([]);
+  const inFlightTurnRef = useRef<boolean>(false);
 
   // Recognition lifecycle refs
   const isSpeakingTtsRef = useRef<boolean>(false);
@@ -79,7 +109,12 @@ export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({ tenant, onCallEnde
   const handleUserSpokeRef = useRef<(rawText: string) => Promise<void>>(async () => {});
 
   useEffect(() => { tenantRef.current = tenant; }, [tenant]);
+  useEffect(() => { authTokenRef.current = authToken; }, [authToken]);
+  useEffect(() => { canPersistLogsRef.current = canPersistLogs; }, [canPersistLogs]);
+  useEffect(() => { demoModeRef.current = offlineDemoMode; }, [offlineDemoMode]);
+  useEffect(() => { setOfflineDemoMode(!geminiConfigured); }, [geminiConfigured]);
   useEffect(() => { onCallEndedRef.current = onCallEnded; }, [onCallEnded]);
+  useEffect(() => { onHandoffCreatedRef.current = onHandoffCreated; }, [onHandoffCreated]);
   useEffect(() => { turnsRef.current = turns; }, [turns]);
   useEffect(() => { callMemoryRef.current = callMemory; }, [callMemory]);
   useEffect(() => { activeLanguageRef.current = activeLanguage; }, [activeLanguage]);
@@ -130,7 +165,7 @@ export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({ tenant, onCallEnde
   // Create speech controller once
   const speechCtrl = useMemo(() => createSpeechController(), []);
   const recognitionRef = useRef<any>(null);
-  const transcriptBottomRef = useRef<HTMLDivElement>(null);
+  const transcriptContainerRef = useRef<HTMLDivElement>(null);
 
   // Check Odia voice support on mount
   useEffect(() => {
@@ -172,9 +207,13 @@ export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({ tenant, onCallEnde
     };
   }, [callActive]);
 
-  // Scroll transcript
+  // Scroll transcript container locally without shifting the page viewport
   useEffect(() => {
-    transcriptBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+    if (turns.length === 0 && !currentInterimSpeech) return;
+    const el = transcriptContainerRef.current;
+    if (el) {
+      el.scrollTop = el.scrollHeight;
+    }
   }, [turns, currentInterimSpeech]);
 
   const clearRestartTimer = () => {
@@ -398,6 +437,9 @@ export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({ tenant, onCallEnde
     setMicErrorNotice(null);
     setTurnErrorNotice(null);
     setIsProcessingTurn(false);
+    inFlightTurnRef.current = false;
+    turnLatenciesRef.current = [];
+    setQueuedHandoffTicket(null);
 
     updateCallActive(true);
     updateActiveLanguage(activeTenant.defaultLanguage);
@@ -450,6 +492,7 @@ export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({ tenant, onCallEnde
     turnAbortRef.current?.abort();
     speechCtrl.stop();
     isSpeakingTtsRef.current = false;
+    inFlightTurnRef.current = false;
     setIsProcessingTurn(false);
     stopListeningMic();
     updateCallActive(false);
@@ -461,7 +504,7 @@ export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({ tenant, onCallEnde
     const endCallback = onCallEndedRef.current;
 
     if (currentTurns.length > 1 && endCallback) {
-      const avgLat = lastLatencyRef.current?.totalTurnaroundMs || 750;
+      const latencyStats = calculatePercentiles(turnLatenciesRef.current);
       const handoffReason = humanHandoffRef.current;
       const capturedMemory = { ...callMemoryRef.current };
 
@@ -469,7 +512,7 @@ export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({ tenant, onCallEnde
         id: `call_${Date.now()}`,
         tenantId: activeTenant.id,
         tenantName: activeTenant.name,
-        callerNumber: capturedMemory.phone || 'Web Voice Session',
+        callerNumber: 'Web Voice Session',
         callerName: capturedMemory.patientName || 'Web Caller',
         startedAt: new Date().toLocaleTimeString(),
         durationSeconds: callDurationRef.current,
@@ -478,8 +521,8 @@ export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({ tenant, onCallEnde
         turns: currentTurns,
         isSampleData: false,
         metrics: {
-          averageLatencyMs: avgLat,
-          p95LatencyMs: Math.round(avgLat * 1.15),
+          averageLatencyMs: latencyStats.average,
+          p95LatencyMs: latencyStats.p95,
           bargeInCount: bargeInCountRef.current,
           toolsExecutedCount: currentTurns.filter(t => t.toolInvoked).length,
           taskCompleted: !handoffReason,
@@ -489,14 +532,22 @@ export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({ tenant, onCallEnde
         capturedMemory,
       };
 
-      // Persist to server SQLite
-      fetch('/api/logs', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(callRecord),
-      }).catch(err => console.warn('Failed to persist call log:', err));
-
-      endCallback(callRecord);
+      if (canPersistLogsRef.current && authTokenRef.current) {
+        fetch('/api/logs', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${authTokenRef.current}`,
+          },
+          body: JSON.stringify(callRecord),
+        })
+          .then(res => res.json().catch(() => ({ persisted: false })))
+          .then(result => endCallback(callRecord, Boolean(result?.persisted)))
+          .catch(() => endCallback(callRecord, false));
+      } else {
+        // Consent declined or zero-retention selected: keep strictly ephemeral
+        endCallback(callRecord, false);
+      }
     }
   };
 
@@ -526,15 +577,17 @@ export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({ tenant, onCallEnde
     }, 250);
   };
 
-  // Handle User Input (Spoken or Typed)
+  // Handle User Input (Spoken or Typed) with strict in-flight lock
   const handleUserSpoke = async (rawText: string) => {
-    if (!rawText.trim() || isUnmountedRef.current) return;
+    if (!rawText.trim() || isUnmountedRef.current || inFlightTurnRef.current) return;
 
+    inFlightTurnRef.current = true;
     const tStart = performance.now();
     const activeTenant = tenantRef.current;
     const currentLang = activeLanguageRef.current;
     const currentMem = callMemoryRef.current;
     const currentTurns = turnsRef.current;
+    const idempotencyKey = `turn_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
     const userTurn: CallTurn = {
       id: `turn_${Date.now()}_u`,
@@ -550,23 +603,27 @@ export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({ tenant, onCallEnde
     setOrbState('processing');
     setTurnErrorNotice(null);
 
-    // Abort any superseded in-flight request to guarantee transcript ordering
-    turnAbortRef.current?.abort();
     const controller = new AbortController();
     turnAbortRef.current = controller;
 
-    // Call server /api/turn endpoint for genuine Gemini answer generation
     try {
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (authTokenRef.current) {
+        headers.Authorization = `Bearer ${authTokenRef.current}`;
+      }
+
       const res = await fetch('/api/turn', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         signal: controller.signal,
         body: JSON.stringify({
           tenantId: activeTenant.id,
           userText: rawText,
           language: currentLang,
           memory: currentMem,
-          history: nextTurnsAfterUser,
+          history: nextTurnsAfterUser.slice(-20),
+          idempotencyKey,
+          demoMode: demoModeRef.current,
         }),
       });
 
@@ -576,10 +633,13 @@ export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({ tenant, onCallEnde
       if (!res.ok || !payload || typeof payload.reply !== 'string') {
         const errMessage =
           payload?.error || `Server returned error status (${res.status}). Please retry.`;
-        throw new Error(errMessage);
+        const err: any = new Error(errMessage);
+        err.canEnableDemo = Boolean(payload?.offlineDemoAvailable || payload?.code === 'GEMINI_NOT_CONFIGURED');
+        throw err;
       }
 
       const measuredLatency = Math.round(performance.now() - tStart);
+      turnLatenciesRef.current.push(measuredLatency);
       const nextLang = (payload.language || currentLang) as SupportedLanguage;
 
       updateActiveLanguage(nextLang);
@@ -591,17 +651,19 @@ export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({ tenant, onCallEnde
 
       updateCallMemory(payload.memoryUpdates || currentMem);
       updateLastLatency({
-        vadMs: payload.latencyBreakdown?.vadMs || 15,
-        sttMs: payload.latencyBreakdown?.sttMs || 25,
-        ragMs: payload.latencyBreakdown?.ragMs || 10,
-        llmFirstTokenMs:
-          payload.latencyBreakdown?.llmFirstTokenMs || Math.max(30, measuredLatency - 50),
-        ttsFirstAudioMs: 15,
+        ragMs: Number(payload.latencyBreakdown?.ragMs ?? 0),
+        modelResponseMs: Number(payload.latencyBreakdown?.modelResponseMs ?? measuredLatency),
         totalTurnaroundMs: measuredLatency,
+        mode: payload.latencyBreakdown?.mode || 'gemini_live',
+        streaming: false,
       });
 
       if (payload.shouldHandoff) {
-        updateHumanHandoff(payload.handoffReason || 'Escalation transfer requested');
+        updateHumanHandoff(payload.handoffReason || 'Callback ticket queued');
+      }
+      if (payload.handoffTicket) {
+        setQueuedHandoffTicket(payload.handoffTicket);
+        onHandoffCreatedRef.current?.(payload.handoffTicket);
       }
 
       const agentTurn: CallTurn = {
@@ -620,7 +682,6 @@ export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({ tenant, onCallEnde
           : undefined,
       };
 
-      setIsProcessingTurn(false);
       updateTurns(prev => [...prev, agentTurn]);
       setOrbState('speaking');
       isSpeakingTtsRef.current = true;
@@ -640,12 +701,15 @@ export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({ tenant, onCallEnde
     } catch (err: any) {
       if (controller.signal.aborted || err?.name === 'AbortError' || isUnmountedRef.current) return;
 
-      setIsProcessingTurn(false);
       const message =
         err instanceof Error && err.message
           ? err.message
           : 'Unable to reach the AI response server. Please check your connection and retry.';
-      setTurnErrorNotice({ message, retryText: rawText });
+      setTurnErrorNotice({
+        message,
+        retryText: rawText,
+        canEnableDemo: Boolean(err?.canEnableDemo),
+      });
 
       isSpeakingTtsRef.current = false;
       if (callActiveRef.current) {
@@ -656,6 +720,9 @@ export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({ tenant, onCallEnde
       } else {
         setOrbState('idle');
       }
+    } finally {
+      inFlightTurnRef.current = false;
+      setIsProcessingTurn(false);
     }
   };
 
@@ -728,11 +795,29 @@ export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({ tenant, onCallEnde
         </div>
       )}
 
+      {/* Explicit Offline Demo Mode Notice when Gemini key is unavailable */}
+      {!geminiConfigured && (
+        <div className="bg-indigo-950/30 border border-indigo-500/30 rounded-2xl p-3.5 flex items-center justify-between gap-3">
+          <div className="text-xs text-indigo-200 leading-relaxed">
+            <strong>Server GEMINI_API_KEY Not Configured:</strong>{' '}
+            {offlineDemoMode
+              ? 'Running in Offline Deterministic Demo Mode (safety rules, keyword RAG, and mock tools).'
+              : 'Live LLM generation is unavailable without an API key.'}
+          </div>
+          <button
+            onClick={() => setOfflineDemoMode(v => !v)}
+            className="px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs shrink-0 cursor-pointer"
+          >
+            {offlineDemoMode ? 'Disable Demo Mode' : 'Enable Offline Demo'}
+          </button>
+        </div>
+      )}
+
       {/* Server AI Generation Error Banner (never silently masked) */}
       {turnErrorNotice && (
         <div
           role="alert"
-          className="bg-rose-950/40 border border-rose-500/40 rounded-2xl p-3.5 flex items-center justify-between gap-3"
+          className="bg-rose-950/40 border border-rose-500/40 rounded-2xl p-3.5 flex flex-wrap items-center justify-between gap-3"
         >
           <div className="flex items-start gap-3">
             <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
@@ -740,15 +825,31 @@ export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({ tenant, onCallEnde
               {turnErrorNotice.message}
             </div>
           </div>
-          {turnErrorNotice.retryText && (
-            <button
-              onClick={() => handleUserSpokeRef.current(turnErrorNotice.retryText!)}
-              className="px-3 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-500 text-white font-semibold text-xs flex items-center gap-1.5 shrink-0 cursor-pointer"
-            >
-              <RotateCcw className="w-3.5 h-3.5" />
-              <span>Retry</span>
-            </button>
-          )}
+          <div className="flex items-center gap-2 shrink-0">
+            {turnErrorNotice.canEnableDemo && !offlineDemoMode && (
+              <button
+                onClick={() => {
+                  setOfflineDemoMode(true);
+                  demoModeRef.current = true;
+                  if (turnErrorNotice.retryText) {
+                    handleUserSpokeRef.current(turnErrorNotice.retryText);
+                  }
+                }}
+                className="px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs cursor-pointer"
+              >
+                Use Offline Demo Mode
+              </button>
+            )}
+            {turnErrorNotice.retryText && (
+              <button
+                onClick={() => handleUserSpokeRef.current(turnErrorNotice.retryText!)}
+                className="px-3 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-500 text-white font-semibold text-xs flex items-center gap-1.5 cursor-pointer"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+                <span>Retry</span>
+              </button>
+            )}
+          </div>
         </div>
       )}
 
@@ -798,7 +899,7 @@ export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({ tenant, onCallEnde
             <div className="flex items-center justify-between text-xs font-mono">
               <span className="text-slate-400 flex items-center gap-1.5">
                 <Zap className="w-3.5 h-3.5 text-emerald-400" />
-                Measured Turn Latency:
+                Measured Round-Trip:
               </span>
               <span className="font-bold text-emerald-400">
                 {lastLatency ? `${lastLatency.totalTurnaroundMs}ms` : '—'}
@@ -808,21 +909,17 @@ export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({ tenant, onCallEnde
             {lastLatency && (
               <div className="space-y-1 text-[11px] font-mono text-slate-400">
                 <div className="flex justify-between">
-                  <span>Language Detect: {lastLatency.vadMs}ms</span>
                   <span>RAG Search: {lastLatency.ragMs}ms</span>
-                  <span>Synthesize/LLM: {lastLatency.llmFirstTokenMs}ms</span>
+                  <span>Model/Pipeline: {lastLatency.modelResponseMs}ms</span>
+                  <span>Mode: {lastLatency.mode === 'offline_demo' ? 'Demo' : lastLatency.mode === 'safety_fastpath' ? 'Safety' : 'Gemini'}</span>
                 </div>
                 <div className="w-full bg-slate-800 rounded-full h-1.5 overflow-hidden flex">
                   <div
-                    style={{ width: `${Math.min(100, (lastLatency.vadMs / lastLatency.totalTurnaroundMs) * 100)}%` }}
-                    className="bg-indigo-500 h-full"
-                  />
-                  <div
-                    style={{ width: `${Math.min(100, (lastLatency.ragMs / lastLatency.totalTurnaroundMs) * 100)}%` }}
+                    style={{ width: `${Math.min(100, (lastLatency.ragMs / Math.max(1, lastLatency.totalTurnaroundMs)) * 100)}%` }}
                     className="bg-amber-500 h-full"
                   />
                   <div
-                    style={{ width: `${Math.min(100, (lastLatency.llmFirstTokenMs / lastLatency.totalTurnaroundMs) * 100)}%` }}
+                    style={{ width: `${Math.min(100, (lastLatency.modelResponseMs / Math.max(1, lastLatency.totalTurnaroundMs)) * 100)}%` }}
                     className="bg-emerald-500 h-full"
                   />
                 </div>
@@ -886,9 +983,11 @@ export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({ tenant, onCallEnde
               <h3 className="text-sm font-bold text-white">Live Call Transcript</h3>
             </div>
 
-            {humanHandoffNotice && (
-              <span className="text-xs px-2 py-0.5 rounded-lg bg-amber-950/60 border border-amber-500/40 text-amber-300 font-mono">
-                Transfer Requested
+            {(queuedHandoffTicket || humanHandoffNotice) && (
+              <span className="text-xs px-2.5 py-0.5 rounded-lg bg-amber-950/60 border border-amber-500/40 text-amber-300 font-mono">
+                {queuedHandoffTicket
+                  ? `Callback Queued: ${queuedHandoffTicket.id} (${queuedHandoffTicket.phone})`
+                  : 'Callback Queued'}
               </span>
             )}
           </div>
@@ -910,6 +1009,7 @@ export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({ tenant, onCallEnde
 
           {/* Scrollable Conversation Stream */}
           <div
+            ref={transcriptContainerRef}
             aria-live="polite"
             className="flex-1 overflow-y-auto space-y-3.5 pr-2 my-2 text-xs"
           >
@@ -954,7 +1054,6 @@ export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({ tenant, onCallEnde
                 Hearing: "{currentInterimSpeech}..."
               </div>
             )}
-            <div ref={transcriptBottomRef} />
           </div>
 
           {/* Quick Test Prompt Bench */}

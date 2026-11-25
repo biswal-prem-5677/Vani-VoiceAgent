@@ -16,7 +16,11 @@ import {
 import { BENCHMARK_CASES } from '../data/evalBenchmark';
 import { BenchmarkCase } from '../types';
 
-export const EvaluationTab: React.FC = () => {
+interface EvaluationTabProps {
+  authToken?: string | null;
+}
+
+export const EvaluationTab: React.FC<EvaluationTabProps> = ({ authToken }) => {
   const [testCases, setTestCases] = useState<BenchmarkCase[]>(BENCHMARK_CASES);
   const [isRunningBench, setIsRunningBench] = useState(false);
   const [activeFilterDifficulty, setActiveFilterDifficulty] = useState<string>('all');
@@ -46,9 +50,12 @@ export const EvaluationTab: React.FC = () => {
   const handleRunBenchmark = async () => {
     setIsRunningBench(true);
     try {
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (authToken) headers.Authorization = `Bearer ${authToken}`;
+
       const res = await fetch('/api/benchmark/run', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
       });
       if (res.ok) {
         const data = await res.json();
@@ -72,14 +79,17 @@ export const EvaluationTab: React.FC = () => {
       for (const tc of BENCHMARK_CASES) {
         const t0 = performance.now();
         try {
+          const fallbackHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
+          if (authToken) fallbackHeaders.Authorization = `Bearer ${authToken}`;
           const res = await fetch('/api/turn', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: fallbackHeaders,
             body: JSON.stringify({
               tenantId: 'kalinga_clinic',
               userText: tc.userInput,
               language: tc.language,
               memory: {},
+              demoMode: true,
             }),
           });
           const turnData = await res.json();
@@ -139,11 +149,11 @@ export const EvaluationTab: React.FC = () => {
           <div className="flex items-center gap-2 mb-1.5">
             <Award className="w-5 h-5 text-indigo-400" />
             <h2 className="text-lg font-bold text-white tracking-tight">
-              Test & Evaluation Harness: Internal Test Set ({BENCHMARK_CASES.length} Cases)
+              Deterministic Routing Test Suite ({BENCHMARK_CASES.length} Cases)
             </h2>
           </div>
           <p className="text-xs text-slate-400 max-w-2xl leading-relaxed">
-            Live execution harness evaluating intent classification, emergency medical detection, tool parameter extraction, and turnaround latency across Odia, Hindi, Hinglish, Bengali, and English.
+            Evaluates rule-based intent classification, safety 112 detection, tool parameter extraction, and turnaround time locally across Odia, Hindi, Hinglish, Bengali, and English (no live LLM quota consumed).
           </p>
         </div>
 

@@ -14,8 +14,10 @@ import {
   Headphones,
   ShieldCheck,
   Activity,
+  LogIn,
+  LogOut,
 } from 'lucide-react';
-import { TenantConfig } from '../types';
+import { TenantConfig, AuthUser } from '../types';
 import { PWAInstallButton } from './PWAInstallButton';
 
 export type ActiveTab = 'call' | 'knowledge' | 'voice' | 'logs' | 'eval' | 'widget';
@@ -32,6 +34,9 @@ interface NavbarProps {
   onOpenSupport: () => void;
   onOpenStatus: () => void;
   onOpenShare: () => void;
+  authUser: AuthUser | null;
+  onOpenAuth: () => void;
+  onSignOut: () => void;
 }
 
 export const Navbar: React.FC<NavbarProps> = ({
@@ -45,6 +50,9 @@ export const Navbar: React.FC<NavbarProps> = ({
   onOpenSupport,
   onOpenStatus,
   onOpenShare,
+  authUser,
+  onOpenAuth,
+  onSignOut,
 }) => {
   const [tenantDropdownOpen, setTenantDropdownOpen] = useState(false);
 
@@ -59,25 +67,25 @@ export const Navbar: React.FC<NavbarProps> = ({
 
   return (
     <header className="sticky top-0 z-40 bg-[#080B10]/95 backdrop-blur-xl border-b border-white/[0.08]">
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-        <div className="flex items-center justify-between h-16 gap-3">
+      <div className="max-w-[1400px] mx-auto px-4 sm:px-6">
+        <div className="flex items-center justify-between h-16 gap-2">
           {/* Zone 1: Single Wordmark Brand */}
-          <div className="flex items-center gap-2.5 shrink-0">
-            <div className="w-9 h-9 rounded-xl bg-gradient-to-tr from-emerald-500 via-teal-400 to-indigo-600 flex items-center justify-center shadow-lg shadow-emerald-500/20 text-white font-black text-base tracking-wider">
+          <div className="flex items-center gap-2 shrink-0">
+            <div className="w-8 h-8 rounded-xl bg-gradient-to-tr from-emerald-500 via-teal-400 to-indigo-600 flex items-center justify-center shadow-lg shadow-emerald-500/20 text-white font-black text-sm tracking-wider">
               V
             </div>
             <div className="leading-tight">
-              <span className="font-extrabold text-base text-white tracking-tight block">
+              <span className="font-extrabold text-sm text-white tracking-tight block whitespace-nowrap">
                 VaniVoice AI
               </span>
-              <span className="text-[11px] text-slate-400 font-mono tracking-tight hidden xl:block">
+              <span className="text-[10px] text-slate-400 font-mono tracking-tight hidden 2xl:block">
                 Multilingual Voice Prototype
               </span>
             </div>
           </div>
 
           {/* Zone 2: Navigation Links */}
-          <nav className="hidden lg:flex items-center gap-0.5 bg-[#0F141F] p-1 rounded-xl border border-white/[0.06]">
+          <nav className="hidden lg:flex items-center gap-0.5 bg-[#0F141F] p-1 rounded-xl border border-white/[0.06] shrink-0">
             {navItems.map(item => {
               const Icon = item.icon;
               const isActive = activeTab === item.id;
@@ -85,7 +93,7 @@ export const Navbar: React.FC<NavbarProps> = ({
                 <button
                   key={item.id}
                   onClick={() => onSelectTab(item.id)}
-                  className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium whitespace-nowrap transition-all cursor-pointer ${
+                  className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[11px] font-medium whitespace-nowrap transition-all cursor-pointer ${
                     isActive
                       ? 'bg-white/10 text-white shadow-sm font-semibold'
                       : 'text-slate-400 hover:text-slate-200 hover:bg-white/[0.04]'
@@ -103,18 +111,18 @@ export const Navbar: React.FC<NavbarProps> = ({
           </nav>
 
           {/* Zone 3: Actions Toolbar & Active Tenant Switcher */}
-          <div className="flex items-center gap-2 shrink-0">
+          <div className="flex items-center gap-1.5 shrink-0">
             {/* PWA Install Button */}
             <PWAInstallButton />
 
             {/* Quick Utility Icon Group */}
-            <div className="hidden sm:flex items-center gap-1 bg-[#0F141F] p-1 rounded-xl border border-white/[0.06]">
+            <div className="hidden sm:flex items-center gap-0.5 bg-[#0F141F] p-1 rounded-xl border border-white/[0.06]">
               <button
                 onClick={onOpenStatus}
                 title="System Operational Status & Telemetry"
                 className="p-1.5 rounded-lg text-slate-400 hover:text-emerald-400 hover:bg-white/[0.04] transition-all cursor-pointer relative"
               >
-                <Activity className="w-4 h-4" />
+                <Activity className="w-3.5 h-3.5" />
                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 absolute top-1 right-1" />
               </button>
 
@@ -123,7 +131,7 @@ export const Navbar: React.FC<NavbarProps> = ({
                 title="Share VaniVoice AI"
                 className="p-1.5 rounded-lg text-slate-400 hover:text-indigo-400 hover:bg-white/[0.04] transition-all cursor-pointer"
               >
-                <Share2 className="w-4 h-4" />
+                <Share2 className="w-3.5 h-3.5" />
               </button>
 
               <button
@@ -131,7 +139,7 @@ export const Navbar: React.FC<NavbarProps> = ({
                 title="Customer Support & Help Desk"
                 className="p-1.5 rounded-lg text-slate-400 hover:text-teal-400 hover:bg-white/[0.04] transition-all cursor-pointer"
               >
-                <Headphones className="w-4 h-4" />
+                <Headphones className="w-3.5 h-3.5" />
               </button>
 
               <button
@@ -139,23 +147,43 @@ export const Navbar: React.FC<NavbarProps> = ({
                 title="Legal, Privacy Policy & Account Deletion"
                 className="p-1.5 rounded-lg text-slate-400 hover:text-slate-200 hover:bg-white/[0.04] transition-all cursor-pointer"
               >
-                <ShieldCheck className="w-4 h-4" />
+                <ShieldCheck className="w-3.5 h-3.5" />
               </button>
             </div>
 
-            <div className="relative">
+            {authUser && (authUser.role === 'super_admin' || authUser.role === 'tenant_admin') ? (
+              <button
+                onClick={onSignOut}
+                title={`Signed in as ${authUser.email} (${authUser.role}) — click to sign out`}
+                className="px-2.5 py-1.5 rounded-xl bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 hover:bg-emerald-500/25 transition-all cursor-pointer flex items-center gap-1 text-[11px] font-semibold whitespace-nowrap shrink-0"
+              >
+                <LogOut className="w-3.5 h-3.5" />
+                <span>Admin</span>
+              </button>
+            ) : (
+              <button
+                onClick={onOpenAuth}
+                title="Admin Sign-In"
+                className="px-2.5 py-1.5 rounded-xl bg-indigo-500/15 border border-indigo-500/30 text-indigo-300 hover:bg-indigo-500/25 transition-all cursor-pointer flex items-center gap-1 text-[11px] font-semibold whitespace-nowrap shrink-0"
+              >
+                <LogIn className="w-3.5 h-3.5" />
+                <span>Sign In</span>
+              </button>
+            )}
+
+            <div className="relative shrink-0">
               <button
                 onClick={() => setTenantDropdownOpen(!tenantDropdownOpen)}
-                className="flex items-center gap-2.5 px-3 py-2 rounded-xl bg-[#0F141F] border border-white/[0.08] hover:border-white/[0.16] text-xs text-slate-200 transition-all shadow-sm cursor-pointer"
+                className="flex items-center gap-2 px-2.5 py-1.5 rounded-xl bg-[#0F141F] border border-white/[0.08] hover:border-white/[0.16] text-[11px] text-slate-200 transition-all shadow-sm cursor-pointer"
               >
               <div
-                className="w-2.5 h-2.5 rounded-full"
+                className="w-2 h-2 rounded-full shrink-0"
                 style={{ backgroundColor: activeTenant.primaryColor }}
               />
-              <span className="font-semibold max-w-[140px] sm:max-w-[190px] truncate">
+              <span className="font-semibold max-w-[115px] xl:max-w-[155px] truncate">
                 {activeTenant.name}
               </span>
-              <ChevronDown className="w-3.5 h-3.5 text-slate-400" />
+              <ChevronDown className="w-3.5 h-3.5 text-slate-400 shrink-0" />
             </button>
 
             {tenantDropdownOpen && (

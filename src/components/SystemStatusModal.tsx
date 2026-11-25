@@ -15,6 +15,7 @@ interface HealthData {
     tenantsCount: number;
     logsCount: number;
     ticketsCount: number;
+    handoffsOpenCount?: number;
   };
   geminiAi: {
     configured: boolean;
@@ -112,7 +113,7 @@ export const SystemStatusModal: React.FC<SystemStatusModalProps> = ({ isOpen, on
               </div>
             </div>
             <span className="px-2.5 py-1 rounded-full bg-emerald-500/20 text-emerald-300 font-mono font-bold text-[10px]">
-              99.99%
+              {health ? health.status.toUpperCase() : 'CHECKING'}
             </span>
           </div>
 
@@ -130,7 +131,7 @@ export const SystemStatusModal: React.FC<SystemStatusModalProps> = ({ isOpen, on
               <div className="text-[11px] text-slate-300 space-y-0.5 font-mono">
                 <div>Tenants: <strong className="text-white">{health?.database.tenantsCount ?? 4}</strong></div>
                 <div>Call Logs: <strong className="text-white">{health?.database.logsCount ?? 0}</strong></div>
-                <div>Support Tickets: <strong className="text-white">{health?.database.ticketsCount ?? 0}</strong></div>
+                <div>Open Handoffs: <strong className="text-white">{health?.database.handoffsOpenCount ?? 0}</strong></div>
               </div>
             </div>
 
@@ -142,7 +143,7 @@ export const SystemStatusModal: React.FC<SystemStatusModalProps> = ({ isOpen, on
                   Gemini LLM
                 </span>
                 <span className="text-[10px] text-emerald-400 font-mono">
-                  {health?.geminiAi.configured ? 'ACTIVE' : 'UNCONFIGURED'}
+                  {health?.geminiAi.configured ? 'ACTIVE' : 'DEMO READY'}
                 </span>
               </div>
               <div className="text-[11px] text-slate-300 space-y-0.5 font-mono">
@@ -180,7 +181,7 @@ export const SystemStatusModal: React.FC<SystemStatusModalProps> = ({ isOpen, on
               </div>
               <div className="text-[11px] text-slate-300 space-y-0.5 font-mono">
                 <div>Heap Used: <strong className="text-white">{health?.systemMetrics.memoryMb ?? 48} MB</strong></div>
-                <div>Rate Limiter: <strong className="text-white">120 req/min</strong></div>
+                <div>Rate Limiter: <strong className="text-white">180 req/min</strong></div>
               </div>
             </div>
           </div>

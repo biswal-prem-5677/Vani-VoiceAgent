@@ -1,4 +1,4 @@
-import type { SupportedLanguage } from '../types/index.ts';
+import type { SupportedLanguage, TenantConfig } from '../types/index.ts';
 
 export interface EmergencyCheckResult {
   isEmergency: boolean;
@@ -27,9 +27,6 @@ const EMERGENCY_PATTERNS = [
 
 /**
  * Whole-word and phrase matches for human escalation/frustration.
- * Avoids substring bugs ('humanities' matching 'human') and avoids
- * false-positive escalation when customers simply ask about "AI agent" capabilities
- * or staff titles without asking to transfer or speak to someone.
  */
 const HUMAN_ESCALATION_REGEX =
   /\b(angry|human|supervisor|useless|stupid|bakwas|insan|gussa|kharap)\b|\b(?:talk|speak|connect|transfer|forward|escalate|hand\s*over|pass)\s+(?:me\s+)?(?:to|with)\s+(?:a\s+|an\s+|the\s+|your\s+)?(?:real\s+)?(?:person|human|agent|manager|officer|representative|staff|specialist)\b|\b(?:call|need|want)\s+(?:a\s+|an\s+|the\s+)?(?:manager|supervisor|human\s+agent|real\s+person)\b/i;
@@ -39,26 +36,67 @@ const HUMAN_ESCALATION_INDIC_TOKENS = [
   'মানুষের সাথে কথা', 'কথা বলতে চাই',
 ];
 
-export function checkEmergencyCondition(text: string, lang: SupportedLanguage): EmergencyCheckResult | null {
+export function checkEmergencyCondition(
+  text: string,
+  lang: SupportedLanguage,
+  tenant?: Pick<TenantConfig, 'name' | 'category' | 'humanHandoffContact'>,
+  handoffTicketId?: string
+): EmergencyCheckResult | null {
   for (const pattern of EMERGENCY_PATTERNS) {
     if (pattern.regex.test(text)) {
-      const messages: Record<SupportedLanguage, string> = {
-        or: 'ଜରୁରୀ ସତର୍କତା: ଏହା ଏକ ମେଡିକାଲ ଏମରଜେନ୍ସି ଜଣାପଡୁଛି। ଦୟାକରି ତୁରନ୍ତ ୧୧୨ (ଜରୁରୀକାଳୀନ ସେବା) ଡାକନ୍ତୁ କିମ୍ବା ନିକଟସ୍ଥ ହସ୍ପିଟାଲକୁ ଯାଆନ୍ତୁ। ମୁଁ ତୁରନ୍ତ ଆମ କ୍ଲିନିକ ଡ୍ୟୁଟି ମେଡିକାଲ ଅଫିସରଙ୍କୁ ଟ୍ରାନ୍ସଫର ରିକ୍ୱେଷ୍ଟ ପଠାଉଛି।',
-        hi: 'आपातकालीन चेतावनी: यह एक मेडिकल इमरजेंसी प्रतीत हो रही है। कृपया तुरंत 112 डायल करें या नजदीकी आपातकालीन केंद्र जाएँ। मैं तुरंत ड्यूटी मेडिकल ऑफिसर को कॉल ट्रांसफर का अनुरोध भेज रहा हूँ।',
-        hinglish: 'EMERGENCY ALERT: Yeh serious medical situation lag rahi hai. Please immediately dial 112 ya nearest hospital jayein. Main duty medical officer ko transfer request initiate kar raha hoon.',
-        bn: 'জরুরি সতর্কতা: এটি একটি মেডিকেল এমার্জেন্সি হতে পারে। অনুগ্রহ করে অবিলম্বে ১১২ ডায়াল করুন বা জরুরি বিভাগে যান। আমি ডিউটি অফিসারের কাছে ট্রান্সফার রিকোয়েস্ট পাঠাচ্ছি।',
-        en: 'EMERGENCY ALERT: This sounds like a medical emergency. Please dial 112 immediately or proceed to the nearest emergency facility. I am requesting an urgent transfer to the clinic Duty Medical Officer right now.',
-      };
+      const desk = tenant?.humanHandoffContact?.department || 'Support Desk';
+      const phone = tenant?.humanHandoffContact?.phone || '112';
+      const isClinic = !tenant || tenant.category === 'clinic';
+      const ticketPhraseEn = handoffTicketId
+        ? `I have logged urgent callback ticket ${handoffTicketId} for ${desk} (${phone}), but please call 112 directly without waiting.`
+        : `Please call 112 directly without waiting; you can also reach ${desk} at ${phone}.`;
+
+      const messages: Record<SupportedLanguage, string> = isClinic
+        ? {
+            or: `ଜରୁରୀ ସତର୍କତା: ଏହା ଏକ ମେଡିକାଲ ଏମରଜେନ୍ସି ଜଣାପଡୁଛି। ଦୟାକରି ତୁରନ୍ତ ୧୧୨ (ଜରୁରୀକାଳୀନ ସେବା) ଡାକନ୍ତୁ କିମ୍ବା ନିକଟସ୍ଥ ହସ୍ପିଟାଲକୁ ଯାଆନ୍ତୁ।${handoffTicketId ? ` କଲ୍‌ବ୍ୟାକ୍ ଟିକେଟ୍ ${handoffTicketId} (${desk}: ${phone}) ନଥିଭୁକ୍ତ ହୋଇଛି।` : ''}`,
+            hi: `आपातकालीन चेतावनी: यह एक मेडिकल इमरजेंसी प्रतीत हो रही है। कृपया तुरंत 112 डायल करें या नजदीकी अस्पताल जाएँ।${handoffTicketId ? ` कॉलबैक टिकट ${handoffTicketId} (${desk}: ${phone}) दर्ज कर लिया गया है।` : ''}`,
+            hinglish: `EMERGENCY ALERT: Yeh medical emergency lag rahi hai. Please immediately 112 dial karein ya nearest hospital jayein.${handoffTicketId ? ` Urgent callback ticket ${handoffTicketId} (${desk}: ${phone}) log kar diya gaya hai.` : ''}`,
+            bn: `জরুরি সতর্কতা: এটি একটি মেডিকেল এমার্জেন্সি হতে পারে। অনুগ্রহ করে অবিলম্বে ১১২ ডায়াল করুন বা নিকটস্থ হাসপাতালে যান।${handoffTicketId ? ` কলব্যাক টিকিট ${handoffTicketId} (${desk}: ${phone}) নথিভুক্ত হয়েছে।` : ''}`,
+            en: `EMERGENCY ALERT: This sounds like a medical emergency. Please dial 112 immediately or proceed to the nearest emergency hospital. ${ticketPhraseEn}`,
+          }
+        : {
+            or: `ଜରୁରୀ ସତର୍କତା: ଯଦି ଏହା ଏକ ମେଡିକାଲ ଏମରଜେନ୍ସି, ଦୟାକରି ତୁରନ୍ତ ୧୧୨ ଡାକନ୍ତୁ। ମୁଁ ${tenant.name} ର ${desk} (${phone}) ପାଇଁ କଲ୍‌ବ୍ୟାକ୍ ଟିକେଟ୍${handoffTicketId ? ` ${handoffTicketId}` : ''} ନଥିଭୁକ୍ତ କରିଛି।`,
+            hi: `आपातकालीन चेतावनी: यदि यह मेडिकल इमरजेंसी है, तो कृपया तुरंत 112 डायल करें। मैंने ${tenant.name} के ${desk} (${phone}) के लिए कॉलबैक टिकट${handoffTicketId ? ` ${handoffTicketId}` : ''} दर्ज किया है।`,
+            hinglish: `EMERGENCY ALERT: Agar yeh medical emergency hai toh please turant 112 dial karein. Maine ${tenant.name} ke ${desk} (${phone}) ke liye callback ticket${handoffTicketId ? ` ${handoffTicketId}` : ''} log kiya hai.`,
+            bn: `জরুরি সতর্কতা: এটি মেডিকেল এমার্জেন্সি হলে অবিলম্বে ১১২ ডায়াল করুন। ${tenant.name}-এর ${desk} (${phone}) টিমের জন্য কলব্যাক টিকিট${handoffTicketId ? ` ${handoffTicketId}` : ''} নথিভুক্ত হয়েছে।`,
+            en: `EMERGENCY ALERT: If this is a life-threatening emergency, please dial 112 immediately. Note that ${tenant.name} is not a medical facility; ${handoffTicketId ? `callback ticket ${handoffTicketId} has been queued for ${desk} (${phone}).` : `you can contact ${desk} at ${phone}.`}`,
+          };
 
       return {
         isEmergency: true,
         symptomDetected: pattern.symptom,
         emergencyMessage: messages[lang] || messages.en,
-        actionRequired: 'Dial 112 immediately; transfer requested to Duty Medical Officer',
+        actionRequired: handoffTicketId
+          ? `Dial 112 immediately; callback ticket ${handoffTicketId} queued for ${desk}`
+          : `Dial 112 immediately; contact ${desk} (${phone})`,
       };
     }
   }
   return null;
+}
+
+export function buildHumanEscalationReply(
+  lang: SupportedLanguage,
+  tenant: Pick<TenantConfig, 'name' | 'humanHandoffContact'>,
+  handoffTicketId?: string
+): string {
+  const dept = tenant.humanHandoffContact.department;
+  const phone = tenant.humanHandoffContact.phone;
+  const ref = handoffTicketId ? ` (${handoffTicketId})` : '';
+
+  const messages: Record<SupportedLanguage, string> = {
+    or: `ମୁଁ ବୁଝିପାରୁଛି ଆପଣ ଜଣେ ଅଧିକାରୀଙ୍କ ସହ କଥା ହେବାକୁ ଚାହୁଁଛନ୍ତି। ${tenant.name} ର ${dept} (${phone}) ପାଇଁ କଲ୍‌ବ୍ୟାକ୍ ଅନୁରୋଧ${ref} କ୍ୟୁରେ ରଖାଯାଇଛି।`,
+    hi: `मैं समझ रहा हूँ कि आप किसी अधिकारी से बात करना चाहते हैं। ${tenant.name} के ${dept} (${phone}) के लिए कॉलबैक अनुरोध${ref} दर्ज कर दिया गया है।`,
+    hinglish: `Samajh gaya. Maine ${tenant.name} ke ${dept} (${phone}) ke liye aapka callback request${ref} queue kar diya hai.`,
+    bn: `আমি বুঝতে পারছি আপনি একজন কর্মকর্তার সাথে কথা বলতে চান। ${tenant.name}-এর ${dept} (${phone})-এর জন্য কলব্যাক অনুরোধ${ref} নথিভুক্ত করা হয়েছে।`,
+    en: `I understand you would like to speak with a staff specialist. Since this web prototype does not bridge live phone lines directly, I have queued callback ticket${ref} for ${tenant.name}'s ${dept} (${phone}).`,
+  };
+  return messages[lang] || messages.en;
 }
 
 export function checkHumanEscalationRequest(text: string): boolean {

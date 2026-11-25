@@ -4,29 +4,45 @@ import {
   PhoneCall,
   Clock,
   Zap,
-  Globe2,
   CheckCircle2,
-  AlertCircle,
   Search,
-  Filter,
   Eye,
   Trash2,
   ShieldCheck,
   X,
+  AlertTriangle,
+  Lock,
+  BellRing,
 } from 'lucide-react';
-import { CallLog, SupportedLanguage } from '../types';
-import { calculatePercentiles, calculateVoiceCallCost } from '../utils/latencyTracker';
+import { CallLog, HandoffTicket, SupportedLanguage } from '../types';
+import { calculatePercentiles } from '../utils/latencyTracker';
 
 interface CallLogsTabProps {
   logs: CallLog[];
+  handoffs?: HandoffTicket[];
+  isAdmin?: boolean;
+  authToken?: string | null;
   onClearLogs?: () => void;
+  onUpdateHandoffStatus?: (id: string, status: HandoffTicket['status']) => Promise<void> | void;
+  onOpenAuth?: () => void;
 }
 
-export const CallLogsTab: React.FC<CallLogsTabProps> = ({ logs, onClearLogs }) => {
+export const CallLogsTab: React.FC<CallLogsTabProps> = ({
+  logs,
+  handoffs = [],
+  isAdmin = false,
+  authToken = null,
+  onClearLogs,
+  onUpdateHandoffStatus,
+  onOpenAuth,
+}) => {
   const [selectedCall, setSelectedCall] = useState<CallLog | null>(null);
   const [searchTerm, setSearchTerm] = useState('');
   const [languageFilter, setLanguageFilter] = useState<string>('all');
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [updatingHandoffId, setUpdatingHandoffId] = useState<string | null>(null);
 
   // Compute all metrics strictly from actual data in logs
   const allLatencies = logs
@@ -35,7 +51,6 @@ export const CallLogsTab: React.FC<CallLogsTabProps> = ({ logs, onClearLogs }) =
 
   const stats = calculatePercentiles(allLatencies);
   const totalDuration = logs.reduce((acc, l) => acc + (l.durationSeconds || 0), 0);
-  const costReport = calculateVoiceCallCost(totalDuration);
 
   const completedCalls = logs.filter(l => l.metrics?.taskCompleted).length;
   const taskCompletionRate = logs.length > 0 ? Math.round((completedCalls / logs.length) * 100) : 0;
@@ -43,18 +58,39 @@ export const CallLogsTab: React.FC<CallLogsTabProps> = ({ logs, onClearLogs }) =
     ? Math.round((logs.filter(l => (l.metrics?.bargeInCount || 0) > 0).length / logs.length) * 100)
     : 0;
 
-  const handleDeleteAll = async () => {
-    if (!confirm('Are you sure you want to delete all call logs? This action will permanently remove stored session transcripts.')) {
-      return;
-    }
+  const handleDeleteConfirmed = async () => {
     setIsDeleting(true);
+    setActionError(null);
     try {
-      await fetch('/api/logs/all', { method: 'DELETE' });
+      const endpoint = isAdmin ? '/api/logs/all' : '/api/session/data';
+      const res = await fetch(endpoint, {
+        method: 'DELETE',
+        headers: authToken ? { Authorization: `Bearer ${authToken}` } : {},
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        setActionError(data.error || `Delete failed (${res.status})`);
+        return;
+      }
+      setConfirmingDelete(false);
       onClearLogs?.();
     } catch (e) {
-      console.error('Failed to delete logs:', e);
+      setActionError('Failed to delete logs: ' + String(e));
     } finally {
       setIsDeleting(false);
+    }
+  };
+
+  const handleStatusUpdate = async (ticketId: string, nextStatus: HandoffTicket['status']) => {
+    if (!onUpdateHandoffStatus) return;
+    setUpdatingHandoffId(ticketId);
+    setActionError(null);
+    try {
+      await onUpdateHandoffStatus(ticketId, nextStatus);
+    } catch (e) {
+      setActionError('Failed to update handoff ticket: ' + String(e));
+    } finally {
+      setUpdatingHandoffId(null);
     }
   };
 
@@ -74,6 +110,35 @@ export const CallLogsTab: React.FC<CallLogsTabProps> = ({ logs, onClearLogs }) =
 
   return (
     <div className="space-y-6">
+      {/* Caller vs Admin Scope Notice */}
+      {!isAdmin && (
+        <div className="bg-indigo-950/30 border border-indigo-500/30 rounded-2xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
+          <div className="flex items-start gap-2.5 text-indigo-200">
+            <Lock className="w-4 h-4 text-indigo-400 shrink-0 mt-0.5" />
+            <div>
+              <strong className="text-white block">Caller Session Scope</strong>
+              <span className="text-slate-300">
+                Showing only consented transcripts recorded during your active browser session. Cross-tenant audit logs and the Staff Handoff Queue require Workspace Admin sign-in.
+              </span>
+            </div>
+          </div>
+          {onOpenAuth && (
+            <button
+              onClick={onOpenAuth}
+              className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-semibold shrink-0 cursor-pointer"
+            >
+              Admin Sign-In
+            </button>
+          )}
+        </div>
+      )}
+
+      {actionError && (
+        <div role="alert" className="p-3 rounded-xl bg-rose-950/40 border border-rose-500/40 text-xs text-rose-200">
+          {actionError}
+        </div>
+      )}
+
       {/* Top Telemetry Metric Cards */}
       <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3.5">
         <div className="bg-[#0D111A] border border-white/[0.08] rounded-2xl p-4 shadow-xl">
@@ -85,7 +150,7 @@ export const CallLogsTab: React.FC<CallLogsTabProps> = ({ logs, onClearLogs }) =
             {logs.length}
           </span>
           <span className="text-[11px] text-slate-400 block mt-1 font-mono">
-            {logs.some(l => l.isSampleData) ? 'Includes sample records' : 'Recorded sessions'}
+            {logs.some(l => l.isSampleData) ? 'Includes sample records' : isAdmin ? 'Authorized tenants' : 'Active session'}
           </span>
         </div>
 
@@ -98,7 +163,7 @@ export const CallLogsTab: React.FC<CallLogsTabProps> = ({ logs, onClearLogs }) =
             {stats.count > 0 ? `${stats.p50}ms` : 'No data yet'}
           </span>
           <span className="text-[11px] text-slate-400 block mt-1 font-mono">
-            {stats.count > 0 ? `${stats.count} turns measured` : 'Awaiting calls'}
+            {stats.count > 0 ? `${stats.count} calls measured` : 'Awaiting calls'}
           </span>
         </div>
 
@@ -153,6 +218,96 @@ export const CallLogsTab: React.FC<CallLogsTabProps> = ({ logs, onClearLogs }) =
         </div>
       </div>
 
+      {/* Staff Handoff Queue (Admin Only) */}
+      {isAdmin && (
+        <div className="bg-[#0D111A] border border-white/[0.08] rounded-2xl p-5 shadow-2xl space-y-4">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <BellRing className="w-4 h-4 text-amber-400" />
+              <h3 className="text-sm font-bold text-white tracking-tight">
+                Staff Callback & Handoff Queue ({handoffs.length})
+              </h3>
+            </div>
+            <span className="text-[11px] text-slate-400 font-mono">
+              {handoffs.filter(h => h.status !== 'resolved').length} open tickets
+            </span>
+          </div>
+
+          {handoffs.length === 0 ? (
+            <p className="text-xs text-slate-400 py-3">
+              No human callback or emergency handoff tickets have been queued yet.
+            </p>
+          ) : (
+            <div className="space-y-2.5">
+              {handoffs.map(ticket => (
+                <div
+                  key={ticket.id}
+                  className="p-3.5 rounded-xl bg-black/40 border border-white/[0.08] flex flex-col md:flex-row md:items-center justify-between gap-3 text-xs"
+                >
+                  <div className="space-y-1">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="font-mono font-bold text-white">{ticket.id}</span>
+                      <span
+                        className={`px-2 py-0.5 rounded font-mono text-[10px] uppercase ${
+                          ticket.priority === 'critical'
+                            ? 'bg-rose-950/60 text-rose-300 border border-rose-500/40'
+                            : ticket.priority === 'high'
+                            ? 'bg-amber-950/60 text-amber-300 border border-amber-500/40'
+                            : 'bg-slate-800 text-slate-300'
+                        }`}
+                      >
+                        {ticket.priority}
+                      </span>
+                      <span
+                        className={`px-2 py-0.5 rounded font-mono text-[10px] uppercase ${
+                          ticket.status === 'resolved'
+                            ? 'bg-emerald-950/50 text-emerald-300 border border-emerald-500/30'
+                            : ticket.status === 'acknowledged'
+                            ? 'bg-indigo-950/50 text-indigo-300 border border-indigo-500/30'
+                            : 'bg-amber-950/50 text-amber-300 border border-amber-500/30'
+                        }`}
+                      >
+                        {ticket.status}
+                      </span>
+                      <span className="text-slate-300 font-semibold">
+                        {ticket.tenantName || ticket.tenantId}
+                      </span>
+                    </div>
+                    <p className="text-slate-300">
+                      <strong className="text-slate-200">{ticket.reason}</strong> — "{ticket.summary}"
+                    </p>
+                    <p className="text-[11px] text-slate-400 font-mono">
+                      Desk: {ticket.department} ({ticket.phone})
+                    </p>
+                  </div>
+
+                  <div className="flex items-center gap-2 shrink-0">
+                    {ticket.status === 'queued' && (
+                      <button
+                        onClick={() => handleStatusUpdate(ticket.id, 'acknowledged')}
+                        disabled={updatingHandoffId === ticket.id}
+                        className="px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white font-semibold cursor-pointer"
+                      >
+                        Acknowledge
+                      </button>
+                    )}
+                    {ticket.status !== 'resolved' && (
+                      <button
+                        onClick={() => handleStatusUpdate(ticket.id, 'resolved')}
+                        disabled={updatingHandoffId === ticket.id}
+                        className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-semibold cursor-pointer"
+                      >
+                        Resolve
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Action Header & Privacy Actions */}
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 bg-[#0D111A] border border-white/[0.08] rounded-2xl p-4">
         <div className="flex items-center gap-2">
@@ -190,16 +345,38 @@ export const CallLogsTab: React.FC<CallLogsTabProps> = ({ logs, onClearLogs }) =
             <option value="en">English</option>
           </select>
 
-          {/* Delete My Data Action (Data Privacy DPDP) */}
-          <button
-            onClick={handleDeleteAll}
-            disabled={isDeleting || logs.length === 0}
-            aria-label="Delete all call records"
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-rose-950/40 hover:bg-rose-900/60 text-rose-300 border border-rose-800/40 text-xs transition-all disabled:opacity-40 cursor-pointer"
-          >
-            <Trash2 className="w-3.5 h-3.5" />
-            <span>Delete My Data</span>
-          </button>
+          {/* Delete My Data Action (Inline confirmation, no browser confirm dialog) */}
+          {confirmingDelete ? (
+            <div className="flex items-center gap-2 bg-rose-950/60 border border-rose-500/40 rounded-xl px-2.5 py-1 text-xs">
+              <AlertTriangle className="w-3.5 h-3.5 text-rose-400 shrink-0" />
+              <span className="text-rose-200">
+                {isAdmin ? 'Erase authorized logs?' : 'Delete session data?'}
+              </span>
+              <button
+                onClick={() => setConfirmingDelete(false)}
+                className="px-2 py-0.5 rounded bg-slate-800 text-slate-200 cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleDeleteConfirmed}
+                disabled={isDeleting}
+                className="px-2 py-0.5 rounded bg-rose-600 hover:bg-rose-500 text-white font-bold cursor-pointer"
+              >
+                {isDeleting ? 'Deleting...' : 'Confirm'}
+              </button>
+            </div>
+          ) : (
+            <button
+              onClick={() => setConfirmingDelete(true)}
+              disabled={isDeleting || logs.length === 0 || !authToken}
+              aria-label="Delete call records"
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-rose-950/40 hover:bg-rose-900/60 text-rose-300 border border-rose-800/40 text-xs transition-all disabled:opacity-40 cursor-pointer"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+              <span>{isAdmin ? 'Delete Authorized Logs' : 'Delete My Data'}</span>
+            </button>
+          )}
         </div>
       </div>
 
@@ -215,7 +392,7 @@ export const CallLogsTab: React.FC<CallLogsTabProps> = ({ logs, onClearLogs }) =
               <p className="text-xs text-slate-400 max-w-sm mx-auto mt-1">
                 {searchTerm || languageFilter !== 'all'
                   ? 'No records match your active search or language filters.'
-                  : 'No call sessions have been recorded yet. Launch a session in the Live Voice Console to view live turn metrics.'}
+                  : 'No consented call sessions have been stored yet. Grant consent with retention > 0 days and complete a call in the Voice Console, or sign in as Admin to review authorized tenant transcripts.'}
               </p>
             </div>
             {(searchTerm || languageFilter !== 'all') && (

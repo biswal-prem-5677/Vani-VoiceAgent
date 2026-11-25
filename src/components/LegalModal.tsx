@@ -1,39 +1,75 @@
 import React, { useState } from 'react';
 import { X, ShieldAlert, FileText, Trash2, CheckCircle2, Lock, AlertTriangle } from 'lucide-react';
+import type { AuthUser } from '../types';
 
 interface LegalModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onDataWiped?: () => void;
+  authToken: string | null;
+  authUser: AuthUser | null;
+  onDataWiped?: (scope: 'session' | 'workspace') => void;
 }
 
-export const LegalModal: React.FC<LegalModalProps> = ({ isOpen, onClose, onDataWiped }) => {
+export const LegalModal: React.FC<LegalModalProps> = ({
+  isOpen,
+  onClose,
+  authToken,
+  authUser,
+  onDataWiped,
+}) => {
   const [activeSubTab, setActiveSubTab] = useState<'privacy' | 'terms' | 'manifest' | 'deletion'>('privacy');
+  const [confirmingWipe, setConfirmingWipe] = useState<'session' | 'workspace' | null>(null);
   const [isWiping, setIsWiping] = useState(false);
   const [wipeSuccess, setWipeSuccess] = useState<string | null>(null);
+  const [wipeError, setWipeError] = useState<string | null>(null);
 
   if (!isOpen) return null;
 
-  const handleWipeAllData = async () => {
-    if (!window.confirm('Are you sure you want to permanently delete all call transcripts, user preferences, and custom tenants from the server? This cannot be undone.')) {
-      return;
-    }
+  const isSuperAdmin = authUser?.role === 'super_admin';
 
+  const handleWipeSessionData = async () => {
     setIsWiping(true);
     setWipeSuccess(null);
+    setWipeError(null);
     try {
-      const res = await fetch('/api/user/wipe-all', { method: 'POST' });
-      const data = await res.json();
+      const res = await fetch('/api/session/data', {
+        method: 'DELETE',
+        headers: authToken ? { Authorization: `Bearer ${authToken}` } : {},
+      });
+      const data = await res.json().catch(() => ({}));
       if (res.ok) {
-        setWipeSuccess('All user records, call transcripts, and session logs have been permanently deleted from SQLite storage and memory.');
-        localStorage.clear();
-        sessionStorage.clear();
-        if (onDataWiped) onDataWiped();
+        setWipeSuccess('All session transcripts, consent settings, and pending actions for your active session have been permanently deleted.');
+        setConfirmingWipe(null);
+        onDataWiped?.('session');
       } else {
-        alert(data.error || 'Failed to wipe data.');
+        setWipeError(data.error || 'Failed to delete session data.');
       }
     } catch (err) {
-      alert('Error contacting server: ' + String(err));
+      setWipeError('Error contacting server: ' + String(err));
+    } finally {
+      setIsWiping(false);
+    }
+  };
+
+  const handleWipeWorkspaceData = async () => {
+    setIsWiping(true);
+    setWipeSuccess(null);
+    setWipeError(null);
+    try {
+      const res = await fetch('/api/user/wipe-all', {
+        method: 'POST',
+        headers: authToken ? { Authorization: `Bearer ${authToken}` } : {},
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) {
+        setWipeSuccess('All workspace call logs, consent records, handoff queues, support tickets, and custom tenants have been permanently wiped.');
+        setConfirmingWipe(null);
+        onDataWiped?.('workspace');
+      } else {
+        setWipeError(data.error || 'Failed to wipe workspace data.');
+      }
+    } catch (err) {
+      setWipeError('Error contacting server: ' + String(err));
     } finally {
       setIsWiping(false);
     }
@@ -50,7 +86,8 @@ export const LegalModal: React.FC<LegalModalProps> = ({ isOpen, onClose, onDataW
           </div>
           <button
             onClick={onClose}
-            className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-white/10 transition"
+            aria-label="Close legal modal"
+            className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-white/10 transition cursor-pointer"
           >
             <X className="w-5 h-5" />
           </button>
@@ -60,7 +97,7 @@ export const LegalModal: React.FC<LegalModalProps> = ({ isOpen, onClose, onDataW
         <div className="flex items-center gap-2 px-6 pt-3 border-b border-white/10 bg-[#0D111A]/60 text-xs font-semibold overflow-x-auto">
           <button
             onClick={() => setActiveSubTab('privacy')}
-            className={`pb-2.5 px-3 border-b-2 transition-all flex items-center gap-1.5 ${
+            className={`pb-2.5 px-3 border-b-2 transition-all flex items-center gap-1.5 cursor-pointer ${
               activeSubTab === 'privacy'
                 ? 'border-indigo-500 text-white'
                 : 'border-transparent text-slate-400 hover:text-slate-200'
@@ -71,7 +108,7 @@ export const LegalModal: React.FC<LegalModalProps> = ({ isOpen, onClose, onDataW
           </button>
           <button
             onClick={() => setActiveSubTab('terms')}
-            className={`pb-2.5 px-3 border-b-2 transition-all flex items-center gap-1.5 ${
+            className={`pb-2.5 px-3 border-b-2 transition-all flex items-center gap-1.5 cursor-pointer ${
               activeSubTab === 'terms'
                 ? 'border-indigo-500 text-white'
                 : 'border-transparent text-slate-400 hover:text-slate-200'
@@ -82,7 +119,7 @@ export const LegalModal: React.FC<LegalModalProps> = ({ isOpen, onClose, onDataW
           </button>
           <button
             onClick={() => setActiveSubTab('manifest')}
-            className={`pb-2.5 px-3 border-b-2 transition-all flex items-center gap-1.5 ${
+            className={`pb-2.5 px-3 border-b-2 transition-all flex items-center gap-1.5 cursor-pointer ${
               activeSubTab === 'manifest'
                 ? 'border-indigo-500 text-white'
                 : 'border-transparent text-slate-400 hover:text-slate-200'
@@ -93,7 +130,7 @@ export const LegalModal: React.FC<LegalModalProps> = ({ isOpen, onClose, onDataW
           </button>
           <button
             onClick={() => setActiveSubTab('deletion')}
-            className={`pb-2.5 px-3 border-b-2 transition-all flex items-center gap-1.5 ${
+            className={`pb-2.5 px-3 border-b-2 transition-all flex items-center gap-1.5 cursor-pointer ${
               activeSubTab === 'deletion'
                 ? 'border-rose-500 text-rose-400'
                 : 'border-transparent text-slate-400 hover:text-rose-300'
@@ -108,32 +145,26 @@ export const LegalModal: React.FC<LegalModalProps> = ({ isOpen, onClose, onDataW
         <div className="flex-1 overflow-y-auto p-6 text-xs text-slate-300 space-y-4 leading-relaxed font-sans">
           {activeSubTab === 'privacy' && (
             <div className="space-y-3">
-              <h3 className="text-sm font-bold text-white">Privacy Policy (India DPDP Act 2023, GDPR & CCPA Aligned)</h3>
+              <h3 className="text-sm font-bold text-white">Privacy Policy (India DPDP Act 2023 Aligned)</h3>
               <p>
-                <strong>Last Updated:</strong> November 2026. VaniVoice AI (&quot;we&quot;, &quot;our&quot;, &quot;platform&quot;) operates as a multi-tenant voice agent engine. We treat user privacy with the highest engineering rigor.
+                <strong>Last Updated:</strong> November 2026. VaniVoice AI is a multilingual, multi-tenant voice workflow prototype.
               </p>
               <div className="p-3 rounded-xl bg-white/[0.03] border border-white/5 space-y-2">
                 <h4 className="font-semibold text-white">1. Audio & Speech Processing</h4>
                 <p>
-                  Microphone audio captured during a voice session is processed directly in your client browser via the standard Web Speech API. Raw audio bytes are never recorded or stored on remote servers. Only transcribed text turns are transmitted to the backend for intent routing and tool execution.
+                  Microphone audio is processed via your browser Web Speech API engine. Raw audio waveforms are not uploaded to VaniVoice AI servers. Transcribed turns are transmitted over HTTPS to <code>/api/turn</code> for AI processing.
                 </p>
               </div>
               <div className="p-3 rounded-xl bg-white/[0.03] border border-white/5 space-y-2">
-                <h4 className="font-semibold text-white">2. Multi-Tenant Data Isolation</h4>
+                <h4 className="font-semibold text-white">2. Consent & Retention Enforcement</h4>
                 <p>
-                  Knowledge base files, FAQs, and business policies uploaded by companies are partitioned per tenant ID. Queries from one tenant cannot access or leak documents belonging to another tenant.
+                  Transcript persistence is strictly gated on explicit consent and a retention window above 0 days. Choosing <strong>Delete on call end (0 days)</strong> or <strong>Ephemeral Only</strong> skips SQLite transcript storage and purges prior logs for your active session. Expired logs are removed automatically by a scheduled retention cleanup job.
                 </p>
               </div>
               <div className="p-3 rounded-xl bg-white/[0.03] border border-white/5 space-y-2">
-                <h4 className="font-semibold text-white">3. Zero Third-Party Tracking SDKs</h4>
+                <h4 className="font-semibold text-white">3. Tenant Isolation & Authorization</h4>
                 <p>
-                  This application contains zero third-party advertising SDKs, behavioral fingerprinting scripts, or cross-site tracking pixels.
-                </p>
-              </div>
-              <div className="p-3 rounded-xl bg-white/[0.03] border border-white/5 space-y-2">
-                <h4 className="font-semibold text-white">4. User Rights & Data Deletion</h4>
-                <p>
-                  In compliance with Apple, Google Play, and DPDP mandates, you retain the unconditional right to erase all session transcripts and user identifiers at any time via the &quot;Account &amp; Data Deletion&quot; tab.
+                  Administrative transcript views, handoff queues, knowledge base editing, and workspace wipes require authenticated server-signed tokens scoped to authorized tenant IDs.
                 </p>
               </div>
             </div>
@@ -145,58 +176,55 @@ export const LegalModal: React.FC<LegalModalProps> = ({ isOpen, onClose, onDataW
               <div className="p-3 rounded-xl bg-rose-500/10 border border-rose-500/20 text-rose-200">
                 <h4 className="font-semibold flex items-center gap-1.5 text-rose-300">
                   <AlertTriangle className="w-4 h-4" />
-                  Critical Healthcare & Safety Disclaimer
+                  Critical Healthcare & Prototype Disclaimer
                 </h4>
                 <p className="mt-1 text-[11px]">
-                  VaniVoice AI is an automated AI software system. For clinic and healthcare tenants, the voice agent is strictly an informational appointment and scheduling assistant. It cannot triage emergencies or provide medical diagnosis. In case of acute medical symptoms (chest pain, respiratory distress, trauma), callers must immediately dial <strong>112</strong> or proceed to the nearest emergency room.
+                  VaniVoice AI is an automated software prototype. It cannot triage emergencies, bridge live emergency telephone lines, or provide medical diagnoses. In acute emergencies, immediately dial <strong>112</strong>.
                 </p>
               </div>
               <p>
-                <strong>Acceptance:</strong> By using VaniVoice AI, you agree not to submit unlawful, infringing, or abusive content. Commercial tenants are solely responsible for ensuring their uploaded documents, clinic fees, and policy statements comply with relevant regional regulations.
-              </p>
-              <p>
-                <strong>Intellectual Property:</strong> Code architecture and software design are protected under open-source Apache-2.0 and author copyrights.
+                <strong>Prototype Data Fixtures:</strong> Built-in tool integrations (clinic appointment booking, parcel tracking, batch schedules, rank cutoffs) operate on sample demonstration records rather than live external EHR or courier carrier systems.
               </p>
             </div>
           )}
 
           {activeSubTab === 'manifest' && (
             <div className="space-y-3">
-              <h3 className="text-sm font-bold text-white">App Store & Play Store Data Safety Manifest</h3>
+              <h3 className="text-sm font-bold text-white">Data Safety Manifest</h3>
               <div className="overflow-x-auto">
                 <table className="w-full text-left border-collapse border border-white/10 text-[11px]">
                   <thead>
                     <tr className="bg-white/5 text-slate-400 border-b border-white/10">
                       <th className="p-2">Data Category</th>
                       <th className="p-2">Collected?</th>
-                      <th className="p-2">Shared with 3rd Parties?</th>
-                      <th className="p-2">Purpose</th>
+                      <th className="p-2">Third-Party Sharing</th>
+                      <th className="p-2">Purpose & Controls</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-white/5">
                     <tr>
-                      <td className="p-2 font-medium text-white">Microphone / Audio</td>
-                      <td className="p-2 text-emerald-400">Streamed locally</td>
-                      <td className="p-2 text-emerald-400">No (Zero sharing)</td>
-                      <td className="p-2 text-slate-400">In-browser speech-to-text recognition</td>
+                      <td className="p-2 font-medium text-white">Microphone Audio</td>
+                      <td className="p-2 text-emerald-400">Browser Speech API</td>
+                      <td className="p-2 text-slate-300">Browser speech vendor</td>
+                      <td className="p-2 text-slate-400">Not stored by VaniVoice servers</td>
+                    </tr>
+                    <tr>
+                      <td className="p-2 font-medium text-white">Text Turns & Prompts</td>
+                      <td className="p-2 text-indigo-300">Sent to /api/turn</td>
+                      <td className="p-2 text-amber-300">Google Gemini API</td>
+                      <td className="p-2 text-slate-400">Generative response synthesis</td>
                     </tr>
                     <tr>
                       <td className="p-2 font-medium text-white">Call Transcripts</td>
-                      <td className="p-2 text-indigo-300">Session text only</td>
-                      <td className="p-2 text-emerald-400">No</td>
-                      <td className="p-2 text-slate-400">Displaying dialog history to caller</td>
+                      <td className="p-2 text-indigo-300">Consent-gated SQLite</td>
+                      <td className="p-2 text-emerald-400">None</td>
+                      <td className="p-2 text-slate-400">Auto-expires per retention setting; 0 days = never stored</td>
                     </tr>
                     <tr>
-                      <td className="p-2 font-medium text-white">Location Data</td>
-                      <td className="p-2 text-slate-500">No</td>
-                      <td className="p-2 text-emerald-400">No</td>
-                      <td className="p-2 text-slate-400">Not requested or used</td>
-                    </tr>
-                    <tr>
-                      <td className="p-2 font-medium text-white">Device Identifiers / Ad IDs</td>
-                      <td className="p-2 text-slate-500">No</td>
-                      <td className="p-2 text-emerald-400">No</td>
-                      <td className="p-2 text-slate-400">Zero advertising or fingerprinting</td>
+                      <td className="p-2 font-medium text-white">Ad IDs / Trackers</td>
+                      <td className="p-2 text-slate-500">None</td>
+                      <td className="p-2 text-emerald-400">None</td>
+                      <td className="p-2 text-slate-400">Zero advertising or fingerprinting SDKs</td>
                     </tr>
                   </tbody>
                 </table>
@@ -209,33 +237,89 @@ export const LegalModal: React.FC<LegalModalProps> = ({ isOpen, onClose, onDataW
               <div className="p-4 rounded-xl bg-rose-500/10 border border-rose-500/20 text-rose-200 space-y-2">
                 <h4 className="font-bold flex items-center gap-1.5 text-rose-300 text-sm">
                   <Trash2 className="w-4 h-4" />
-                  Full Account & Data Deletion (Apple / Google Compliance)
+                  Session & Workspace Data Deletion
                 </h4>
                 <p className="text-xs">
-                  Triggering this action immediately purges all stored call transcripts, user retention consent timestamps, custom tenant documents, and temporary server tokens from the SQLite database.
+                  Delete data strictly scoped to your active session at any time, or (when signed in as a Workspace Super Admin) reset all workspace records.
                 </p>
               </div>
 
-              {wipeSuccess ? (
+              {wipeError && (
+                <div className="p-3 rounded-xl bg-rose-500/15 border border-rose-500/30 text-rose-200 text-xs">
+                  {wipeError}
+                </div>
+              )}
+
+              {wipeSuccess && (
                 <div className="p-3 rounded-xl bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 flex items-center gap-2">
                   <CheckCircle2 className="w-4 h-4 shrink-0 text-emerald-400" />
                   <span>{wipeSuccess}</span>
                 </div>
-              ) : (
-                <div className="pt-2">
-                  <button
-                    onClick={handleWipeAllData}
-                    disabled={isWiping}
-                    className="w-full py-3 px-4 rounded-xl bg-rose-600 hover:bg-rose-500 text-white font-bold text-xs flex items-center justify-center gap-2 transition shadow-lg cursor-pointer disabled:opacity-50"
-                  >
-                    <Trash2 className="w-4 h-4" />
-                    <span>{isWiping ? 'Purging All Records...' : 'Permanently Delete All My Data Now'}</span>
-                  </button>
-                  <p className="text-[11px] text-slate-400 text-center mt-2">
-                    Action takes effect immediately across server SQLite databases and client storage.
-                  </p>
-                </div>
               )}
+
+              <div className="space-y-3 pt-1">
+                {confirmingWipe === 'session' ? (
+                  <div className="p-3 rounded-xl bg-rose-950/40 border border-rose-500/40 flex items-center justify-between gap-3">
+                    <span className="text-rose-200">Confirm deleting all logs and consent records for this session?</span>
+                    <div className="flex gap-2 shrink-0">
+                      <button
+                        onClick={() => setConfirmingWipe(null)}
+                        className="px-3 py-1.5 rounded-lg bg-slate-800 text-slate-200 cursor-pointer"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        onClick={handleWipeSessionData}
+                        disabled={isWiping}
+                        className="px-3 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-500 text-white font-bold cursor-pointer"
+                      >
+                        {isWiping ? 'Deleting...' : 'Confirm Delete'}
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <button
+                    onClick={() => setConfirmingWipe('session')}
+                    disabled={isWiping || !authToken}
+                    className="w-full py-2.5 px-4 rounded-xl bg-slate-800 hover:bg-slate-700 border border-white/10 text-white font-semibold text-xs flex items-center justify-center gap-2 transition cursor-pointer disabled:opacity-50"
+                  >
+                    <Trash2 className="w-4 h-4 text-rose-400" />
+                    <span>Delete My Current Session Data</span>
+                  </button>
+                )}
+
+                {isSuperAdmin && (
+                  confirmingWipe === 'workspace' ? (
+                    <div className="p-3 rounded-xl bg-rose-950/50 border border-rose-500/50 flex items-center justify-between gap-3">
+                      <span className="text-rose-200">Confirm wiping ALL workspace transcripts, handoffs, tickets, and custom tenants?</span>
+                      <div className="flex gap-2 shrink-0">
+                        <button
+                          onClick={() => setConfirmingWipe(null)}
+                          className="px-3 py-1.5 rounded-lg bg-slate-800 text-slate-200 cursor-pointer"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          onClick={handleWipeWorkspaceData}
+                          disabled={isWiping}
+                          className="px-3 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-500 text-white font-bold cursor-pointer"
+                        >
+                          {isWiping ? 'Wiping...' : 'Confirm Global Wipe'}
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <button
+                      onClick={() => setConfirmingWipe('workspace')}
+                      disabled={isWiping}
+                      className="w-full py-2.5 px-4 rounded-xl bg-rose-600 hover:bg-rose-500 text-white font-bold text-xs flex items-center justify-center gap-2 transition shadow-lg cursor-pointer disabled:opacity-50"
+                    >
+                      <Trash2 className="w-4 h-4" />
+                      <span>Wipe All Workspace Data (Super Admin)</span>
+                    </button>
+                  )
+                )}
+              </div>
             </div>
           )}
         </div>
@@ -244,7 +328,7 @@ export const LegalModal: React.FC<LegalModalProps> = ({ isOpen, onClose, onDataW
         <div className="px-6 py-3 border-t border-white/10 bg-[#0A0E17] flex justify-end">
           <button
             onClick={onClose}
-            className="px-4 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-white transition"
+            className="px-4 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-white transition cursor-pointer"
           >
             Close
           </button>

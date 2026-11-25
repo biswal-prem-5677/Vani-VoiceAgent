@@ -1,35 +1,33 @@
 # Privacy, Consent & Safety Guidelines
 
-## 1. Medical Emergency Fast-Path (`src/utils/safety.ts`)
+## 1. Tenant-Aware Emergency Fast-Path (`src/utils/safety.ts`)
 
-Every incoming turn in `POST /api/turn` runs `checkEmergencyCondition(userText, activeLang)` **before** general conversational generation:
-- Matches critical emergency patterns across Odia, Hindi, Hinglish, Bengali, and English (e.g., chest pain, severe breathing difficulty, heavy bleeding, unconsciousness, stroke, severe trauma).
-- Immediately returns a localized **Dial 112** emergency instruction, sets `isEmergency: true` and `shouldHandoff: true`, and records an urgent escalation request in call memory (`escalationStatus: 'Transfer requested to Duty Medical Officer'`).
-- Healthcare tenant prompts also enforce a strict non-diagnostic boundary: the assistant explains clinic departments, OPD timings, and appointment preparation, but does not diagnose conditions or prescribe treatments.
-
----
-
-## 2. Human Escalation Routing
-
-`checkHumanEscalationRequest(userText)` triggers a staff transfer (`shouldHandoff: true`) when callers express frustration or explicitly ask to speak/transfer to a human, manager, or supervisor. Whole-word and phrase patterns prevent false triggers on words like `"humanities"` or informational questions such as `"What services can this voice agent help me with today?"` or `"Is there a placement officer?"`.
+Every incoming turn in `POST /api/turn` runs `checkEmergencyCondition(userText, activeLang, tenant, ticketId)` **before** general model generation:
+- Matches life-threatening symptom indicators across Odia, Hindi, Hinglish, Bengali, and English (chest pain, breathing difficulty, heavy bleeding, unconsciousness, stroke, major accidents).
+- **Clinic Tenants (`category === 'clinic'`)**: Immediately instructs dialing **112** or visiting the nearest emergency hospital, logs a `critical` ticket in SQLite `handoff_tickets`, and includes the tenant desk phone number.
+- **Non-Clinic Tenants**: Immediately advises dialing **112**, clarifies that the business tenant is not a medical facility (never falsely routing to a clinic Duty Medical Officer), and queues a callback ticket for that tenant's own escalation desk.
 
 ---
 
-## 3. Data Privacy & User Controls (India DPDP Alignment)
+## 2. Durable Staff Handoff Queue (`handoff_tickets`)
 
-- **Consent Banner (`src/components/ConsentBanner.tsx`)**: Informs users that browser `SpeechRecognition` handles microphone audio through the browser speech engine and lets them select a transcript retention policy (`7`, `30`, or `90` days, or `0` = do not retain / delete on call end), persisted via `POST /api/consent`.
-- **Transcript Deletion (`CallLogsTab.tsx`, `LegalModal.tsx`)**:
-  - `DELETE /api/logs/all` deletes all saved call transcripts from `call_logs`.
-  - `POST /api/user/wipe-all` wipes call logs, consent settings, support tickets, and custom tenants, then restores the default seeded demo tenants.
-- **No Exposed Secrets**: `GEMINI_API_KEY` is accessed strictly server-side inside `server.ts` and is never bundled into client JavaScript.
-- **Request Caps & Rate Limiting**:
-  - Express enforces a `500kb` JSON body limit across routes.
-  - `POST /api/turn` rejects inputs above `1000` characters and enforces an IP rate limit of `120 requests/min`.
-- **Prompt-Injection Hygiene**: System instructions mark caller utterances and uploaded knowledge base documents as untrusted input data.
+`checkHumanEscalationRequest(userText)` uses whole-word regexes and Indic-script escalation tokens (preventing false triggers on `"humanities"`, `"What can this agent do?"`, or `"campus officer"`). When triggered:
+- A `HND-XXXXXX` record is persisted in SQLite `handoff_tickets`.
+- Replies state clearly that the web prototype has **queued a callback ticket** with the department's contact details rather than claiming a live PSTN phone bridge.
+- Scoped admins can review, **Acknowledge**, and **Resolve** tickets via `Call Transcripts` (`GET /api/handoffs`, `PATCH /api/handoffs/:id`).
 
 ---
 
-## 4. Prototype & Clinical Disclaimers
+## 3. Data Privacy & DPDP-Aligned Retention Controls
 
-- **Demo Mode Notice**: This application is a functional prototype. Built-in tool handlers execute against sample local fixtures (`src/utils/tools.ts`) rather than external hospital EHR or courier carrier systems.
-- **Not Medical Advice**: Clinic responses and emergency 112 routing are assistive workflow demonstrations only and do not replace licensed medical triage or emergency dispatch.
+- **Explicit Consent & Retention Enforcement (`ConsentBanner.tsx`, `/api/consent`, `/api/logs`)**:
+  - Supported retention options: `7`, `30`, `90`, or `0` days (`Delete on call end`).
+  - Choosing **Ephemeral Only** (`consented: false`) or `0` days deletes any stored logs for the current session immediately and prevents `POST /api/logs` from writing transcripts to SQLite (`persisted: false`).
+  - Persisted logs receive an `expires_at` timestamp swept automatically on startup and every 15 minutes.
+- **Scoped Data Deletion (`LegalModal.tsx`, `CallLogsTab.tsx`)**:
+  - `DELETE /api/session/data`: Any caller can permanently erase logs, consent preferences, and pending action state for their active session.
+  - `DELETE /api/logs/all`: Authorized admins erase logs only within `allowedTenants`.
+  - `POST /api/user/wipe-all`: Restricted exclusively to `super_admin`; wipes all transcripts, consent records, handoffs, support tickets, pending actions, and custom tenants, then restores default demo tenants.
+- **Security Headers & Input Caps**:
+  - Zod runtime schemas validate every write endpoint; `/api/turn` caps `userText` (`1000` chars), `history` (`24` turns), and `memory` (`20` keys) and runs behind `60 req/min` per-IP turn rate limits.
+  - Bearer tokens remain strictly in React memory (`App.tsx`) and `GEMINI_API_KEY` / `ADMIN_PASSCODE` / `SESSION_SECRET` remain strictly server-side.

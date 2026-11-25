@@ -61,6 +61,7 @@ export interface TenantConfig {
     phone: string;
     email: string;
   };
+  isPublicSummaryOnly?: boolean;
 }
 
 export interface CallTurn {
@@ -80,12 +81,41 @@ export interface CallTurn {
 }
 
 export interface LatencyBreakdown {
-  vadMs: number;
-  sttMs: number;
   ragMs: number;
-  llmFirstTokenMs: number;
-  ttsFirstAudioMs: number;
+  modelResponseMs: number;
   totalTurnaroundMs: number;
+  mode?: 'gemini_live' | 'offline_demo' | 'safety_fastpath';
+  streaming?: boolean;
+  // Kept optional for backwards-compatibility with older log payloads
+  vadMs?: number;
+  sttMs?: number;
+  llmFirstTokenMs?: number;
+  ttsFirstAudioMs?: number;
+}
+
+export interface HandoffTicket {
+  id: string;
+  tenantId: string;
+  tenantName?: string;
+  sessionId: string;
+  reason: string;
+  priority: 'critical' | 'high' | 'normal';
+  summary: string;
+  department: string;
+  phone: string;
+  status: 'queued' | 'acknowledged' | 'resolved';
+  notes?: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface AuthUser {
+  id: string;
+  name: string;
+  email: string;
+  role: 'caller' | 'tenant_admin' | 'super_admin';
+  allowedTenants: string[];
+  sessionId: string;
 }
 
 export interface CallLog {
@@ -121,7 +151,6 @@ export interface BenchmarkCase {
   expectedTool?: string;
   groundTruthOdiaPhrase?: string;
   difficulty: 'Easy' | 'Medium' | 'Challenging (Code-switch)';
-  // Real execution metrics
   measuredLatencyMs?: number;
   measuredIntent?: string;
   toolCallCorrect?: boolean;
@@ -130,4 +159,3 @@ export interface BenchmarkCase {
   actualReply?: string;
   executionStatus?: 'idle' | 'running' | 'completed' | 'error';
 }
-

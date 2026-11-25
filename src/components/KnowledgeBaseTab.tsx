@@ -82,7 +82,7 @@ export const KnowledgeBaseTab: React.FC<KnowledgeBaseTabProps> = ({
             </h2>
           </div>
           <p className="text-xs text-slate-400 max-w-2xl leading-relaxed">
-            Every business tenant's documents are hermetically partitioned. Upload FAQs, consultation fees, return rules, or admission cutoffs. The agent answers exclusively from these verified chunks with sub-50ms vector retrieval.
+            Every business tenant&apos;s documents are stored under its tenant ID. Upload FAQs, consultation fees, return rules, or admission cutoffs for cross-lingual keyword matching and Gemini context grounding.
           </p>
         </div>
 
@@ -102,10 +102,10 @@ export const KnowledgeBaseTab: React.FC<KnowledgeBaseTabProps> = ({
           <div className="flex items-center gap-2">
             <Sparkles className="w-4 h-4 text-amber-400" />
             <h3 className="text-sm font-bold text-white">
-              Real-time RAG Retrieval Simulator (Semantic BM25 Token Matching)
+              Knowledge Retrieval Simulator (Cross-Lingual Keyword Scoring)
             </h3>
           </div>
-          <span className="text-xs text-slate-400 font-mono">Retrieval target &lt;45ms</span>
+          <span className="text-xs text-slate-400 font-mono">Local JS scoring</span>
         </div>
 
         <form onSubmit={handleTestRag} className="flex gap-2">
