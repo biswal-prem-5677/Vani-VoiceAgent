@@ -40,6 +40,13 @@ import {
   computeAvailableSlots,
   isSlotAlreadyBooked,
 } from './actionConfirmation.ts';
+import {
+  validateOutboundWebhookUrl,
+  signWebhookPayload,
+  verifyWebhookSignature,
+  buildCalendarIcs,
+} from './externalIntegration.ts';
+import { computeOperationalMetrics } from './operationalMetrics.ts';
 import { INITIAL_TENANTS } from '../data/tenants.ts';
 
 const clinicTenant = INITIAL_TENANTS[0];
@@ -483,4 +490,173 @@ test('Red-Team & Prompt Injection: Untrusted instructions do not bypass system r
   assert.strictEqual(injectionTurn.toolResult?.requiresConfirmation, true);
   assert.strictEqual(injectionTurn.toolResult?.data?.bookingRef, undefined);
 });
+
+test('P1 SSRF Guard & HMAC Webhook Signing: Blocks private metadata IPs and validates signatures', () => {
+  assert.strictEqual(validateOutboundWebhookUrl('https://ehr.kalinga.org/webhook').valid, true);
+  assert.strictEqual(validateOutboundWebhookUrl('http://127.0.0.1:3000/hook', false).valid, false);
+  assert.strictEqual(validateOutboundWebhookUrl('http://169.254.169.254/latest/meta-data', false).valid, false);
+  assert.strictEqual(validateOutboundWebhookUrl('https://10.0.0.5/internal', false).valid, false);
+  assert.strictEqual(validateOutboundWebhookUrl('http://127.0.0.1:4555/hook', true).valid, true);
+
+  const secret = 'webhook-signing-test-secret';
+  const payload = JSON.stringify({ eventType: 'appointment.booked', ref: 'KAL-APT-2026' });
+  const sig = signWebhookPayload(secret, 1764000000, payload);
+  assert.strictEqual(verifyWebhookSignature(secret, sig, payload), true);
+  assert.strictEqual(verifyWebhookSignature(secret, sig, payload + 'tampered'), false);
+  assert.strictEqual(verifyWebhookSignature('wrong-secret', sig, payload), false);
+});
+
+test('P1 Calendar Invite (.ics) & Operational KPI Metrics: Generates RFC-5545 invites and computes real KPIs', () => {
+  const ics = buildCalendarIcs(
+    {
+      id: 'KAL-APT-8821',
+      tenantId: 'kalinga_clinic',
+      sessionId: 'sess_1',
+      doctor: 'Dr. Jena',
+      slot: '10:00 AM',
+      patientName: 'Priya',
+      status: 'confirmed',
+      actionId: 'act_1',
+      createdAt: 1764000000000,
+      expiresAt: null,
+    },
+    clinicTenant
+  );
+  assert.ok(ics.includes('BEGIN:VCALENDAR'));
+  assert.ok(ics.includes('METHOD:REQUEST'));
+  assert.ok(ics.includes('STATUS:CONFIRMED'));
+  assert.ok(ics.includes('KAL-APT-8821'));
+
+  const kpis = computeOperationalMetrics({
+    logs: [
+      {
+        id: 'c1',
+        tenantId: 'kalinga_clinic',
+        tenantName: 'Kalinga Care Clinic',
+        callerNumber: 'Web',
+        callerName: 'Caller 1',
+        startedAt: '10:00',
+        durationSeconds: 45,
+        languagesUsed: ['or'],
+        detectedIntent: 'book_appointment',
+        turns: [],
+        metrics: {
+          averageLatencyMs: 320,
+          p95LatencyMs: 410,
+          bargeInCount: 0,
+          toolsExecutedCount: 1,
+          taskCompleted: true,
+          handedOffToHuman: false,
+          satisfactionScore: 5,
+        },
+        capturedMemory: {},
+      },
+      {
+        id: 'c2',
+        tenantId: 'kalinga_clinic',
+        tenantName: 'Kalinga Care Clinic',
+        callerNumber: 'Web',
+        callerName: 'Caller 2',
+        startedAt: '10:15',
+        durationSeconds: 30,
+        languagesUsed: ['en'],
+        detectedIntent: 'emergency_medical',
+        turns: [
+          {
+            id: 't1',
+            speaker: 'agent',
+            text: 'err',
+            language: 'en',
+            timestamp: 1,
+            toolInvoked: { toolName: 'book_appointment', params: {}, result: { success: false } },
+          },
+        ],
+        metrics: {
+          averageLatencyMs: 180,
+          p95LatencyMs: 180,
+          bargeInCount: 0,
+          toolsExecutedCount: 1,
+          taskCompleted: false,
+          handedOffToHuman: true,
+          satisfactionScore: 3,
+        },
+        capturedMemory: {},
+      },
+    ],
+    handoffs: [
+      {
+        id: 'HND-1',
+        tenantId: 'kalinga_clinic',
+        sessionId: 'c2',
+        reason: 'Emergency',
+        priority: 'critical',
+        summary: 'Chest pain',
+        department: 'Emergency',
+        phone: '112',
+        status: 'queued',
+        createdAt: 1,
+        updatedAt: 1,
+      },
+    ],
+    appointments: [
+      {
+        id: 'KAL-APT-1',
+        tenantId: 'kalinga_clinic',
+        sessionId: 'c1',
+        doctor: 'Dr. Jena',
+        slot: '10:00 AM',
+        patientName: 'Priya',
+        status: 'confirmed',
+        actionId: 'a1',
+        createdAt: 1,
+        expiresAt: null,
+      },
+    ],
+    integrations: [
+      {
+        id: 'del_1',
+        tenantId: 'kalinga_clinic',
+        eventType: 'appointment.booked',
+        targetUrl: 'https://ehr.example/hook',
+        status: 'delivered',
+        attemptCount: 1,
+        lastStatusCode: 200,
+        lastError: null,
+        latencyMs: 42,
+        idempotencyKey: 'k1',
+        createdAt: 1,
+        updatedAt: 1,
+      },
+    ],
+  });
+
+  assert.strictEqual(kpis.containmentRatePct, 50);
+  assert.strictEqual(kpis.handoffRatePct, 50);
+  assert.strictEqual(kpis.bookingCompletionRatePct, 100);
+  assert.strictEqual(kpis.webhookSuccessRatePct, 100);
+  assert.strictEqual(kpis.safetyEscalationsCount, 1);
+  assert.strictEqual(kpis.failedToolCallsCount, 1);
+});
+
+test('P2 Multilingual Safety & Malformed Tool Guards: Covers Bengali/Hinglish/Odia/Hindi safety and blocks unknown/empty tool args', () => {
+  const bengaliEmergency = checkEmergencyCondition('আমার বাবার বুকে খুব ব্যথা হচ্ছে এবং শ্বাস নিতে পারছেন না', 'bn', clinicTenant);
+  assert.ok(bengaliEmergency !== null && bengaliEmergency.isEmergency === true);
+
+  const hinglishEmergency = checkEmergencyCondition('Papa ko chest pain ho raha hai urgent help chahiye', 'hinglish', clinicTenant);
+  assert.ok(hinglishEmergency !== null && hinglishEmergency.isEmergency === true);
+
+  // Unknown tool must never execute
+  const unknownTool = executeTenantTool('drop_all_tables', {}, clinicTenant.name, 'en');
+  assert.strictEqual(unknownTool.success, false);
+
+  // Blank/whitespace patient name rejected cleanly
+  const blankArg = executeTenantTool(
+    'book_appointment',
+    { doctor: 'Dr. Jena', slot: '10:00 AM', patientName: '   ', confirmed: true },
+    clinicTenant.name,
+    'en'
+  );
+  assert.strictEqual(blankArg.success, false);
+});
+
 

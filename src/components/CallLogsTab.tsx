@@ -15,20 +15,41 @@ import {
   BellRing,
   CalendarCheck,
   History,
+  Webhook,
+  RotateCcw,
+  Users,
+  Calendar,
 } from 'lucide-react';
-import { CallLog, HandoffTicket, SupportedLanguage, AppointmentRecord, AuditLogEntry } from '../types';
+import {
+  CallLog,
+  HandoffTicket,
+  SupportedLanguage,
+  AppointmentRecord,
+  AuditLogEntry,
+  IntegrationDelivery,
+  OperationalMetricsSummary,
+  WorkspaceUserRecord,
+} from '../types';
 import { calculatePercentiles } from '../utils/latencyTracker';
+import { computeOperationalMetrics } from '../utils/operationalMetrics';
 
 interface CallLogsTabProps {
   logs: CallLog[];
   handoffs?: HandoffTicket[];
   appointments?: AppointmentRecord[];
   auditLogs?: AuditLogEntry[];
+  integrations?: IntegrationDelivery[];
+  operationalMetrics?: OperationalMetricsSummary | null;
+  workspaceUsers?: WorkspaceUserRecord[];
   isAdmin?: boolean;
+  isSuperAdmin?: boolean;
   authToken?: string | null;
   onClearLogs?: () => void;
   onUpdateHandoffStatus?: (id: string, status: HandoffTicket['status']) => Promise<void> | void;
   onUpdateAppointmentStatus?: (id: string, status: AppointmentRecord['status']) => Promise<void> | void;
+  onRetryIntegration?: (id: string) => Promise<void> | void;
+  onUpdateUserRole?: (userId: string, role: WorkspaceUserRecord['role']) => Promise<void> | void;
+  onToggleUserRevoke?: (userId: string, revoked: boolean) => Promise<void> | void;
   onOpenAuth?: () => void;
 }
 
@@ -37,11 +58,18 @@ export const CallLogsTab: React.FC<CallLogsTabProps> = ({
   handoffs = [],
   appointments = [],
   auditLogs = [],
+  integrations = [],
+  operationalMetrics = null,
+  workspaceUsers = [],
   isAdmin = false,
+  isSuperAdmin = false,
   authToken = null,
   onClearLogs,
   onUpdateHandoffStatus,
   onUpdateAppointmentStatus,
+  onRetryIntegration,
+  onUpdateUserRole,
+  onToggleUserRevoke,
   onOpenAuth,
 }) => {
   const [selectedCall, setSelectedCall] = useState<CallLog | null>(null);
@@ -52,8 +80,10 @@ export const CallLogsTab: React.FC<CallLogsTabProps> = ({
   const [actionError, setActionError] = useState<string | null>(null);
   const [updatingHandoffId, setUpdatingHandoffId] = useState<string | null>(null);
   const [updatingAppointmentId, setUpdatingAppointmentId] = useState<string | null>(null);
+  const [retryingDeliveryId, setRetryingDeliveryId] = useState<string | null>(null);
+  const [updatingUserId, setUpdatingUserId] = useState<string | null>(null);
 
-  // Compute all metrics strictly from actual data in logs
+  // Compute all metrics strictly from actual data
   const allLatencies = logs
     .map(l => l.metrics?.averageLatencyMs)
     .filter((l): l is number => typeof l === 'number' && l > 0);
@@ -66,6 +96,75 @@ export const CallLogsTab: React.FC<CallLogsTabProps> = ({
   const bargeInRate = logs.length > 0
     ? Math.round((logs.filter(l => (l.metrics?.bargeInCount || 0) > 0).length / logs.length) * 100)
     : 0;
+
+  const kpis =
+    operationalMetrics ||
+    computeOperationalMetrics({ logs, handoffs, appointments, integrations });
+
+  const handleDownloadIcs = async (aptId: string) => {
+    if (!authToken) return;
+    try {
+      const res = await fetch(`/api/appointments/${encodeURIComponent(aptId)}/calendar.ics`, {
+        headers: { Authorization: `Bearer ${authToken}` },
+      });
+      if (!res.ok) {
+        const d = await res.json().catch(() => ({}));
+        setActionError(d.error || 'Failed to download .ics invite.');
+        return;
+      }
+      const text = await res.text();
+      const blob = new Blob([text], { type: 'text/calendar;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `appointment-${aptId}.ics`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      setActionError('Failed to download calendar invite: ' + String(e));
+    }
+  };
+
+  const handleRetryDelivery = async (id: string) => {
+    if (!onRetryIntegration) return;
+    setRetryingDeliveryId(id);
+    setActionError(null);
+    try {
+      await onRetryIntegration(id);
+    } catch (e) {
+      setActionError('Failed to retry webhook delivery: ' + String(e));
+    } finally {
+      setRetryingDeliveryId(null);
+    }
+  };
+
+  const handleRoleChange = async (userId: string, role: WorkspaceUserRecord['role']) => {
+    if (!onUpdateUserRole) return;
+    setUpdatingUserId(userId);
+    setActionError(null);
+    try {
+      await onUpdateUserRole(userId, role);
+    } catch (e) {
+      setActionError('Failed to update user role: ' + String(e));
+    } finally {
+      setUpdatingUserId(null);
+    }
+  };
+
+  const handleRevokeToggle = async (userId: string, revoked: boolean) => {
+    if (!onToggleUserRevoke) return;
+    setUpdatingUserId(userId);
+    setActionError(null);
+    try {
+      await onToggleUserRevoke(userId, revoked);
+    } catch (e) {
+      setActionError('Failed to update user access status: ' + String(e));
+    } finally {
+      setUpdatingUserId(null);
+    }
+  };
 
   const handleDeleteConfirmed = async () => {
     setIsDeleting(true);
@@ -240,6 +339,58 @@ export const CallLogsTab: React.FC<CallLogsTabProps> = ({
         </div>
       </div>
 
+      {/* Operational Outcomes Dashboard (Admin Only) */}
+      {isAdmin && (
+        <div className="bg-[#0D111A] border border-indigo-500/20 rounded-2xl p-5 shadow-2xl space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h3 className="text-sm font-bold text-white tracking-tight">
+              FDE Operational Outcomes &amp; Integration Reliability
+            </h3>
+            <span className="text-[11px] font-mono text-slate-400">
+              Computed from durable tenant sessions, clinic ledger, and webhook queue
+            </span>
+          </div>
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-3 text-xs">
+            <div className="p-3 rounded-xl bg-black/40 border border-white/[0.06]">
+              <span className="text-slate-400 block">AI Containment Rate</span>
+              <span className="text-xl font-bold font-mono text-emerald-400 tabular-nums">
+                {kpis.totalSessions > 0 ? `${kpis.containmentRatePct}%` : '—'}
+              </span>
+              <span className="text-[10px] text-slate-500 block font-mono">Handoff: {kpis.handoffRatePct}%</span>
+            </div>
+            <div className="p-3 rounded-xl bg-black/40 border border-white/[0.06]">
+              <span className="text-slate-400 block">Booking Completion</span>
+              <span className="text-xl font-bold font-mono text-sky-400 tabular-nums">
+                {appointments.length > 0 ? `${kpis.bookingCompletionRatePct}%` : '—'}
+              </span>
+              <span className="text-[10px] text-slate-500 block font-mono">{kpis.confirmedAppointments} confirmed</span>
+            </div>
+            <div className="p-3 rounded-xl bg-black/40 border border-white/[0.06]">
+              <span className="text-slate-400 block">Webhook Delivery</span>
+              <span className="text-xl font-bold font-mono text-indigo-400 tabular-nums">
+                {kpis.deliveredCount + kpis.failedDeliveriesCount > 0 ? `${kpis.webhookSuccessRatePct}%` : '—'}
+              </span>
+              <span className="text-[10px] text-slate-500 block font-mono">
+                {kpis.deliveredCount} ok / {kpis.failedDeliveriesCount} failed
+              </span>
+            </div>
+            <div className="p-3 rounded-xl bg-black/40 border border-white/[0.06]">
+              <span className="text-slate-400 block">Safety Escalations</span>
+              <span className="text-xl font-bold font-mono text-amber-400 tabular-nums">
+                {kpis.safetyEscalationsCount}
+              </span>
+              <span className="text-[10px] text-slate-500 block font-mono">Critical emergency tickets</span>
+            </div>
+            <div className="p-3 rounded-xl bg-black/40 border border-white/[0.06]">
+              <span className="text-slate-400 block">Failed Tool Calls</span>
+              <span className="text-xl font-bold font-mono text-rose-400 tabular-nums">
+                {kpis.failedToolCallsCount}
+              </span>
+              <span className="text-[10px] text-slate-500 block font-mono">Non-confirmation errors</span>
+            </div>
+          </div>
+        </div>
+      )}
       {/* Staff Handoff Queue (Admin Only) */}
       {isAdmin && (
         <div className="bg-[#0D111A] border border-white/[0.08] rounded-2xl p-5 shadow-2xl space-y-4">
@@ -379,15 +530,167 @@ export const CallLogsTab: React.FC<CallLogsTabProps> = ({
                     </p>
                   </div>
 
-                  {apt.status === 'confirmed' && (
+                  <div className="flex items-center gap-2 shrink-0">
+                    {apt.status === 'confirmed' && (
+                      <>
+                        <button
+                          onClick={() => handleDownloadIcs(apt.id)}
+                          className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-indigo-950/60 hover:bg-indigo-900/80 border border-indigo-500/40 text-indigo-200 font-semibold cursor-pointer"
+                        >
+                          <Calendar className="w-3.5 h-3.5" />
+                          <span>.ics Invite</span>
+                        </button>
+                        <button
+                          onClick={() => handleAppointmentUpdate(apt.id, 'cancelled')}
+                          disabled={updatingAppointmentId === apt.id}
+                          className="px-3 py-1.5 rounded-lg bg-rose-950/60 hover:bg-rose-900/80 border border-rose-500/40 disabled:opacity-50 text-rose-200 font-semibold cursor-pointer shrink-0"
+                        >
+                          {updatingAppointmentId === apt.id ? 'Updating...' : 'Cancel Slot'}
+                        </button>
+                      </>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Outbound Webhook Integration Delivery Queue (Admin Only) */}
+      {isAdmin && (
+        <div className="bg-[#0D111A] border border-white/[0.08] rounded-2xl p-5 shadow-2xl space-y-4">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <Webhook className="w-4 h-4 text-sky-400" />
+              <h3 className="text-sm font-bold text-white tracking-tight">
+                Outbound EHR &amp; Webhook Deliveries ({integrations.length})
+              </h3>
+            </div>
+            <span className="text-[11px] text-slate-400 font-mono">
+              HMAC-SHA256 signed • bounded exponential backoff
+            </span>
+          </div>
+
+          {integrations.length === 0 ? (
+            <p className="text-xs text-slate-400 py-2">
+              No outbound webhook deliveries recorded yet. Enable a webhook URL in Voice &amp; Tools to dispatch booking/handoff events externally.
+            </p>
+          ) : (
+            <div className="space-y-2.5">
+              {integrations.slice(0, 20).map(del => (
+                <div
+                  key={del.id}
+                  className="p-3.5 rounded-xl bg-black/40 border border-white/[0.08] flex flex-col md:flex-row md:items-center justify-between gap-3 text-xs"
+                >
+                  <div className="space-y-1">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="font-mono font-bold text-white">{del.eventType}</span>
+                      <span
+                        className={`px-2 py-0.5 rounded font-mono text-[10px] uppercase ${
+                          del.status === 'delivered'
+                            ? 'bg-emerald-950/50 text-emerald-300 border border-emerald-500/30'
+                            : del.status === 'failed'
+                            ? 'bg-rose-950/50 text-rose-300 border border-rose-500/30'
+                            : 'bg-slate-800 text-slate-300 border border-slate-700'
+                        }`}
+                      >
+                        {del.status}
+                      </span>
+                      <span className="text-[11px] font-mono text-slate-400">
+                        attempts={del.attemptCount}
+                        {del.lastStatusCode ? ` • HTTP ${del.lastStatusCode}` : ''}
+                        {del.latencyMs ? ` • ${del.latencyMs}ms` : ''}
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-slate-400 font-mono truncate max-w-xl">
+                      Target: {del.targetUrl || 'Not configured'} • Key: {del.idempotencyKey}
+                    </p>
+                    {del.lastError && (
+                      <p className="text-[11px] text-rose-300 font-mono">{del.lastError}</p>
+                    )}
+                  </div>
+
+                  {del.status === 'failed' && onRetryIntegration && (
                     <button
-                      onClick={() => handleAppointmentUpdate(apt.id, 'cancelled')}
-                      disabled={updatingAppointmentId === apt.id}
-                      className="px-3 py-1.5 rounded-lg bg-rose-950/60 hover:bg-rose-900/80 border border-rose-500/40 disabled:opacity-50 text-rose-200 font-semibold cursor-pointer shrink-0"
+                      onClick={() => handleRetryDelivery(del.id)}
+                      disabled={retryingDeliveryId === del.id}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-500 disabled:opacity-50 text-white font-semibold cursor-pointer shrink-0"
                     >
-                      {updatingAppointmentId === apt.id ? 'Updating...' : 'Cancel Slot'}
+                      <RotateCcw className="w-3.5 h-3.5" />
+                      <span>{retryingDeliveryId === del.id ? 'Retrying...' : 'Retry Delivery'}</span>
                     </button>
                   )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Workspace User Governance (Super-Admin Only) */}
+      {isSuperAdmin && (
+        <div className="bg-[#0D111A] border border-white/[0.08] rounded-2xl p-5 shadow-2xl space-y-4">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <Users className="w-4 h-4 text-purple-400" />
+              <h3 className="text-sm font-bold text-white tracking-tight">
+                Workspace Identity &amp; Access Governance ({workspaceUsers.length})
+              </h3>
+            </div>
+            <span className="text-[11px] text-slate-400 font-mono">
+              Role &amp; revocation checks take effect immediately
+            </span>
+          </div>
+
+          {workspaceUsers.length === 0 ? (
+            <p className="text-xs text-slate-400 py-2">No registered OIDC or workspace users found.</p>
+          ) : (
+            <div className="space-y-2">
+              {workspaceUsers.map(usr => (
+                <div
+                  key={usr.id}
+                  className="p-3 rounded-xl bg-black/40 border border-white/[0.08] flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs"
+                >
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <span className="font-semibold text-white">{usr.name}</span>
+                      <span className="font-mono text-[11px] text-slate-400">{usr.email}</span>
+                      {usr.revoked && (
+                        <span className="px-1.5 py-0.5 rounded bg-rose-950/60 border border-rose-500/40 text-rose-300 font-mono text-[10px]">
+                          REVOKED
+                        </span>
+                      )}
+                    </div>
+                    <span className="text-[10px] font-mono text-slate-500">
+                      provider={usr.authProvider || 'workspace_local'} • tenants={usr.allowedTenants.join(', ') || 'none'}
+                    </span>
+                  </div>
+
+                  <div className="flex items-center gap-2 shrink-0">
+                    <select
+                      value={usr.role}
+                      disabled={updatingUserId === usr.id}
+                      onChange={e => handleRoleChange(usr.id, e.target.value as WorkspaceUserRecord['role'])}
+                      aria-label={`Role for ${usr.email}`}
+                      className="bg-black/60 border border-white/[0.12] rounded-lg px-2 py-1 text-xs text-slate-200"
+                    >
+                      <option value="caller">caller</option>
+                      <option value="tenant_admin">tenant_admin</option>
+                      <option value="super_admin">super_admin</option>
+                    </select>
+                    <button
+                      onClick={() => handleRevokeToggle(usr.id, !usr.revoked)}
+                      disabled={updatingUserId === usr.id}
+                      className={`px-3 py-1 rounded-lg font-semibold cursor-pointer border ${
+                        usr.revoked
+                          ? 'bg-emerald-950/50 border-emerald-500/40 text-emerald-200'
+                          : 'bg-rose-950/50 border-rose-500/40 text-rose-200'
+                      }`}
+                    >
+                      {usr.revoked ? 'Restore' : 'Revoke'}
+                    </button>
+                  </div>
                 </div>
               ))}
             </div>

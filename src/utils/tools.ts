@@ -247,10 +247,10 @@ export function executeTenantTool(
 
     default:
       return {
-        success: true,
+        success: false,
         toolName,
-        outputMessage: `Tool ${toolName} acknowledged by ${tenantName}.`,
-        data: { ...parameters },
+        outputMessage: `Unsupported or unauthorized tool "${toolName}" for ${tenantName}.`,
+        data: { error: 'UNKNOWN_TOOL' },
       };
   }
 }

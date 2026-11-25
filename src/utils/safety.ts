@@ -20,7 +20,7 @@ const EMERGENCY_PATTERNS = [
   // Hinglish
   { regex: /\b(?:chest\s*pain|saans\s*nahi|breathlessness|cannot\s*breathe|cant\s*breathe|khoon\s*beh|bleeding\s*heavily|unconscious|behosh|heart\s*attack|stroke|serious\s*accident)\b/i, symptom: 'Acute medical distress' },
   // Bengali
-  { regex: /(?:বুকে\s*ব্যথা|শ্বাসকষ্ট|শ্বাস\s*নিতে\s*পারছি\s*না|রক্তপাত|অচেতন|স্ট্রোক|হার্ট\s*অ্যাটাক|দুর্ঘটনা)/i, symptom: 'Emergency symptom' },
+  { regex: /(?:বুকে(?:\s+\S+){0,3}\s*(?:ব্যথা|যন্ত্রণা)|শ্বাসকষ্ট|শ্বাস\s*নিতে\s*(?:পারছি|পারছেন|পারছে)\s*না|শ্বাস(?:\s+\S+){0,2}\s*(?:কষ্ট|বন্ধ)|রক্তপাত|অচেতন|স্ট্রোক|হার্ট\s*অ্যাটাক|দুর্ঘটনা)/i, symptom: 'Emergency symptom' },
   // English
   { regex: /\b(?:chest\s*pain|cannot\s*breathe|can't\s*breathe|shortness\s*of\s*breath|difficulty\s*breathing|heavy\s*bleeding|unconscious|passed\s*out|stroke|heart\s*attack|cardiac\s*arrest|severe\s*accident|emergency)\b/i, symptom: 'Emergency medical condition' },
 ];

@@ -21,7 +21,27 @@ import { SystemStatusModal } from './components/SystemStatusModal';
 import { ShareModal } from './components/ShareModal';
 import { AdminAuthPanel } from './components/AdminAuthPanel';
 import { INITIAL_TENANTS } from './data/tenants';
-import { TenantConfig, DocumentChunk, CallLog, AuthUser, HandoffTicket, AppointmentRecord, AuditLogEntry } from './types';
+import {
+  TenantConfig,
+  DocumentChunk,
+  CallLog,
+  AuthUser,
+  HandoffTicket,
+  AppointmentRecord,
+  AuditLogEntry,
+  IntegrationDelivery,
+  OperationalMetricsSummary,
+  WorkspaceUserRecord,
+} from './types';
+import { testConnection, getFirebaseAuth, signOutFirebase } from './lib/firebase';
+import {
+  syncTenantWorkspaceToFirestore,
+  persistCallSessionToFirestore,
+  persistHandoffToFirestore,
+  updateHandoffInFirestore,
+  updateAppointmentInFirestore,
+  deleteUserSessionDocsFromFirestore,
+} from './lib/firestoreStore';
 import {
   Globe2,
   ShieldCheck,
@@ -40,6 +60,9 @@ export default function App() {
   const [handoffs, setHandoffs] = useState<HandoffTicket[]>([]);
   const [appointments, setAppointments] = useState<AppointmentRecord[]>([]);
   const [auditLogs, setAuditLogs] = useState<AuditLogEntry[]>([]);
+  const [integrations, setIntegrations] = useState<IntegrationDelivery[]>([]);
+  const [operationalMetrics, setOperationalMetrics] = useState<OperationalMetricsSummary | null>(null);
+  const [workspaceUsers, setWorkspaceUsers] = useState<WorkspaceUserRecord[]>([]);
 
   // In-memory auth session state (tokens are never written to localStorage/sessionStorage)
   const [authToken, setAuthToken] = useState<string | null>(null);
@@ -106,15 +129,18 @@ export default function App() {
     }
   }, []);
 
-  const loadAdminWorkspaceData = useCallback(async (token: string) => {
+  const loadAdminWorkspaceData = useCallback(async (token: string, role?: AuthUser['role']) => {
     await fetchTenantsForToken(token);
     try {
       const headers = { Authorization: `Bearer ${token}` };
-      const [logsRes, handoffsRes, apptsRes, auditRes] = await Promise.all([
+      const [logsRes, handoffsRes, apptsRes, auditRes, intRes, metricsRes, usersRes] = await Promise.all([
         fetch('/api/logs', { headers }),
         fetch('/api/handoffs', { headers }),
         fetch('/api/appointments', { headers }),
         fetch('/api/audit-logs', { headers }),
+        fetch('/api/integrations', { headers }),
+        fetch('/api/metrics/operational', { headers }),
+        role === 'super_admin' ? fetch('/api/auth/users', { headers }) : Promise.resolve(null),
       ]);
       if (logsRes.ok) {
         const logsData = await logsRes.json();
@@ -131,6 +157,20 @@ export default function App() {
       if (auditRes.ok) {
         const auditData = await auditRes.json();
         if (Array.isArray(auditData)) setAuditLogs(auditData);
+      }
+      if (intRes.ok) {
+        const intData = await intRes.json();
+        if (Array.isArray(intData)) setIntegrations(intData);
+      }
+      if (metricsRes.ok) {
+        const metricsData = await metricsRes.json();
+        if (metricsData && typeof metricsData.totalSessions === 'number') {
+          setOperationalMetrics(metricsData);
+        }
+      }
+      if (usersRes && usersRes.ok) {
+        const usersData = await usersRes.json();
+        if (Array.isArray(usersData)) setWorkspaceUsers(usersData);
       }
     } catch {
       // ignore
@@ -156,8 +196,9 @@ export default function App() {
     await fetchTenantsForToken(null);
   }, [fetchTenantsForToken, loadCallerLogs]);
 
-  // Initial mount: read server capabilities and initialize scoped caller session
+  // Initial mount: read server capabilities, probe Firestore connectivity, and initialize caller session
   useEffect(() => {
+    void testConnection();
     fetch('/api/session')
       .then(res => (res.ok ? res.json() : null))
       .then(data => {
@@ -186,17 +227,26 @@ export default function App() {
     setSessionMeta(prev => ({ ...prev, adminBootstrapNeeded: false }));
     setIsAuthModalOpen(false);
     setAdminErrorBanner(null);
-    await loadAdminWorkspaceData(token);
+    if (user.role === 'super_admin' || user.role === 'tenant_admin') {
+      await loadAdminWorkspaceData(token, user.role);
+    } else {
+      await fetchTenantsForToken(token);
+      await loadCallerLogs(token);
+    }
   };
 
   const handleSignOut = async () => {
     setHandoffs([]);
     setAppointments([]);
     setAuditLogs([]);
+    setIntegrations([]);
+    setOperationalMetrics(null);
+    setWorkspaceUsers([]);
     setCallLogs([]);
     setAdminErrorBanner(null);
     setAuthToken(null);
     setAuthUser(null);
+    await signOutFirebase().catch(() => {});
     await bootstrapCallerSession();
   };
 
@@ -239,6 +289,10 @@ export default function App() {
       const saved = data.tenant || newTenant;
       setTenants(prev => [...prev, saved]);
       setActiveTenant(saved);
+      const fbUid = getFirebaseAuth().currentUser?.uid;
+      if (fbUid) {
+        void syncTenantWorkspaceToFirestore(saved, fbUid).catch(() => {});
+      }
     } catch (err) {
       setAdminErrorBanner('Failed to create tenant: ' + String(err));
     }
@@ -295,6 +349,11 @@ export default function App() {
         setActiveTenant(previous);
         setTenants(prev => prev.map(t => (t.id === previous.id ? previous : t)));
         setAdminErrorBanner(data.error || `Failed to update tenant settings (${res.status}).`);
+        return;
+      }
+      const fbUid = getFirebaseAuth().currentUser?.uid;
+      if (fbUid) {
+        void syncTenantWorkspaceToFirestore(data.tenant || updatedTenant, fbUid).catch(() => {});
       }
     } catch (err) {
       setActiveTenant(previous);
@@ -306,13 +365,21 @@ export default function App() {
   const handleCallEnded = (newLog: CallLog, persisted: boolean) => {
     if (persisted) {
       setCallLogs(prev => [newLog, ...prev]);
+      const fbUid = getFirebaseAuth().currentUser?.uid;
+      if (fbUid && consentChoice.retentionDays > 0) {
+        void persistCallSessionToFirestore(newLog, fbUid, consentChoice.retentionDays).catch(() => {});
+      }
     }
     if (isAdmin && authToken) {
-      loadAdminWorkspaceData(authToken);
+      loadAdminWorkspaceData(authToken, authUser?.role);
     }
   };
 
   const handleHandoffCreated = (ticket: HandoffTicket) => {
+    const fbUid = getFirebaseAuth().currentUser?.uid;
+    if (fbUid) {
+      void persistHandoffToFirestore(ticket, fbUid).catch(() => {});
+    }
     if (isAdmin) {
       setHandoffs(prev => [ticket, ...prev]);
     }
@@ -338,6 +405,9 @@ export default function App() {
     setHandoffs(prev =>
       prev.map(h => (h.id === id ? { ...h, status, updatedAt: Date.now() } : h))
     );
+    if (getFirebaseAuth().currentUser?.uid) {
+      void updateHandoffInFirestore(id, status).catch(() => {});
+    }
   };
 
   const handleUpdateAppointmentStatus = async (
@@ -358,10 +428,75 @@ export default function App() {
       throw new Error(data.error || `Failed to update appointment (${res.status})`);
     }
     setAppointments(prev => prev.map(a => (a.id === id ? { ...a, status } : a)));
+    if (data?.integrationDelivery) {
+      setIntegrations(prev => [data.integrationDelivery, ...prev]);
+    }
+    if (getFirebaseAuth().currentUser?.uid) {
+      void updateAppointmentInFirestore(id, status).catch(() => {});
+    }
+  };
+
+  const handleRetryIntegration = async (id: string) => {
+    if (!authToken) return;
+    const res = await fetch(`/api/integrations/${id}/retry`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${authToken}` },
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data.error || `Retry failed (${res.status})`);
+    }
+    if (data?.delivery) {
+      setIntegrations(prev => prev.map(item => (item.id === id ? data.delivery : item)));
+    }
+  };
+
+  const handleUpdateUserRole = async (userId: string, role: WorkspaceUserRecord['role']) => {
+    if (!authToken) return;
+    const res = await fetch(`/api/auth/users/${userId}/role`, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${authToken}`,
+      },
+      body: JSON.stringify({ role }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data.error || `Role update failed (${res.status})`);
+    }
+    if (data?.user) {
+      setWorkspaceUsers(prev =>
+        prev.map(u =>
+          u.id === userId ? { ...u, role: data.user.role, allowedTenants: data.user.allowedTenants } : u
+        )
+      );
+    }
+  };
+
+  const handleToggleUserRevoke = async (userId: string, revoked: boolean) => {
+    if (!authToken) return;
+    const res = await fetch(`/api/auth/users/${userId}/revoke`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${authToken}`,
+      },
+      body: JSON.stringify({ revoked }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data.error || `Revocation update failed (${res.status})`);
+    }
+    setWorkspaceUsers(prev => prev.map(u => (u.id === userId ? { ...u, revoked } : u)));
   };
 
   const handleClearLogs = () => {
     setCallLogs([]);
+    const fbUid = getFirebaseAuth().currentUser?.uid;
+    if (fbUid && !isAdmin) {
+      void deleteUserSessionDocsFromFirestore(fbUid).catch(() => {});
+    }
   };
 
   const canPersistLogs = consentChoice.consented && consentChoice.retentionDays > 0;
@@ -503,11 +638,18 @@ export default function App() {
               handoffs={handoffs}
               appointments={appointments}
               auditLogs={auditLogs}
+              integrations={integrations}
+              operationalMetrics={operationalMetrics}
+              workspaceUsers={workspaceUsers}
               isAdmin={isAdmin}
+              isSuperAdmin={isSuperAdmin}
               authToken={authToken}
               onClearLogs={handleClearLogs}
               onUpdateHandoffStatus={handleUpdateHandoffStatus}
               onUpdateAppointmentStatus={handleUpdateAppointmentStatus}
+              onRetryIntegration={handleRetryIntegration}
+              onUpdateUserRole={handleUpdateUserRole}
+              onToggleUserRevoke={handleToggleUserRevoke}
               onOpenAuth={() => setIsAuthModalOpen(true)}
             />
           )}
@@ -607,7 +749,9 @@ export default function App() {
               setHandoffs([]);
               setAppointments([]);
               setAuditLogs([]);
-              loadAdminWorkspaceData(authToken);
+              setIntegrations([]);
+              setOperationalMetrics(null);
+              loadAdminWorkspaceData(authToken, authUser?.role);
             }
           }}
         />

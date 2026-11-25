@@ -15,6 +15,7 @@ import {
   ShieldAlert,
   Info,
   RotateCcw,
+  Calendar,
 } from 'lucide-react';
 import {
   TenantConfig,
@@ -772,6 +773,28 @@ export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({
     }
   };
 
+  const downloadAppointmentIcs = async (bookingRef: string) => {
+    if (!authTokenRef.current) return;
+    try {
+      const res = await fetch(`/api/appointments/${encodeURIComponent(bookingRef)}/calendar.ics`, {
+        headers: { Authorization: `Bearer ${authTokenRef.current}` },
+      });
+      if (!res.ok) return;
+      const icsText = await res.text();
+      const blob = new Blob([icsText], { type: 'text/calendar;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `appointment-${bookingRef}.ics`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch {
+      // ignore transient download error
+    }
+  };
+
   return (
     <div className="space-y-6">
       {/* AI Prototype & Safety Disclaimer Banner */}
@@ -1057,8 +1080,20 @@ export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({
                   </span>
                 )}
                 {turn.toolInvoked && (
-                  <div className="mt-2 p-2 rounded-lg bg-black/50 border border-emerald-500/30 text-emerald-400 font-mono text-[11px]">
-                    Tool: {turn.toolInvoked.toolName}
+                  <div className="mt-2 p-2 rounded-lg bg-black/50 border border-emerald-500/30 text-emerald-400 font-mono text-[11px] flex flex-wrap items-center justify-between gap-2">
+                    <span>Tool: {turn.toolInvoked.toolName}</span>
+                    {turn.toolInvoked.toolName === 'book_appointment' &&
+                      turn.toolInvoked.result?.success &&
+                      turn.toolInvoked.result?.data?.bookingRef && (
+                        <button
+                          type="button"
+                          onClick={() => downloadAppointmentIcs(turn.toolInvoked!.result.data.bookingRef)}
+                          className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-200 border border-emerald-500/40 cursor-pointer"
+                        >
+                          <Calendar className="w-3 h-3" />
+                          <span>Download .ics Invite ({turn.toolInvoked.result.data.bookingRef})</span>
+                        </button>
+                      )}
                   </div>
                 )}
               </div>

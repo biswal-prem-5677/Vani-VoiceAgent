@@ -20,8 +20,14 @@ First-run claim endpoint (`201 Created`) creating the initial `super_admin` user
 ### `POST /api/auth/login`
 Authenticates via registered SQLite email + password, or via server `ADMIN_PASSCODE` if configured (`timingSafeEqual`), returning `{ token, user }` and recording an `auth.login` audit event.
 
+### `POST /api/auth/firebase`
+Verifies a Firebase Google OIDC ID token server-side (`verifyIdToken`), enforces `email_verified === true`, auto-provisions the workspace primary `ADMIN_EMAIL` as `super_admin` (or loads an existing registered account), checks revocation status, and returns `{ token, user }`.
+
 ### `GET /api/auth/users` & `POST /api/auth/users` *(Super Admin only)*
-Lists registered admin accounts or provisions a scoped `tenant_admin` / `super_admin` with `allowedTenants`.
+Lists registered admin accounts (including `revoked` state) or provisions a scoped `tenant_admin` / `super_admin` with `allowedTenants`.
+
+### `PATCH /api/auth/users/:id/role` & `POST /api/auth/users/:id/revoke` *(Super Admin only)*
+Updates a user's `role` and `allowedTenants`, or revokes/restores workspace access (`{ revoked: boolean }`). Revoked users are blocked immediately on their next API request (`401`) and cannot re-exchange Firebase OIDC tokens (`403`).
 
 ---
 
@@ -68,20 +74,29 @@ Returns call logs belonging strictly to the caller's active `sessionId`.
 Returns persisted logs strictly scoped to the admin's `allowedTenants`.
 
 ### `DELETE /api/session/data` *(Authenticated)*
-Deletes `call_logs`, `handoff_tickets`, `support_tickets`, `appointments`, `consent_records`, and `pending_actions` belonging strictly to the caller's `sessionId`, returning deleted row counts.
+Deletes `call_logs`, `handoff_tickets`, `support_tickets`, `appointments`, `integration_deliveries`, `consent_records`, and `pending_actions` belonging strictly to the caller's `sessionId`, returning deleted row counts.
 
 ### `DELETE /api/logs/all` *(Admin scoped)* & `POST /api/user/wipe-all` *(Super Admin only)*
-Deletes logs within the admin's authorized tenants (`/api/logs/all`), or wipes all transcripts, consent records, handoffs, appointments, support tickets, audit logs, pending actions, and custom tenants and re-seeds default tenants (`/api/user/wipe-all`).
+Deletes logs within the admin's authorized tenants (`/api/logs/all`), or wipes all transcripts, consent records, handoffs, appointments, integration deliveries, support tickets, audit logs, pending actions, and custom tenants and re-seeds default tenants (`/api/user/wipe-all`).
 
 ---
 
-## 5. Staff Handoffs, Clinic Appointments, Audit Trail & Support
+## 5. Staff Handoffs, Clinic Appointments, Webhooks, Metrics & Support
 
 ### `GET /api/handoffs?tenantId=...` & `PATCH /api/handoffs/:id` *(Admin scoped)*
 Lists or updates (`'queued' | 'acknowledged' | 'resolved'`) tenant-scoped callback/emergency handoff tickets.
 
 ### `GET /api/appointments?tenantId=...` & `PATCH /api/appointments/:id` *(Admin scoped)*
-Lists durable SQLite appointments (`KAL-APT-XXXX`, `actionId`, `doctor`, `slot`, `patientName`, `status`) or updates status (`'confirmed' | 'cancelled'`), releasing cancelled slots immediately for re-booking.
+Lists durable SQLite appointments (`KAL-APT-XXXX`, `actionId`, `doctor`, `slot`, `patientName`, `status`) or updates status (`'confirmed' | 'cancelled'`), releasing cancelled slots immediately for re-booking and dispatching `appointment.cancelled` webhooks if configured.
+
+### `GET /api/appointments/:id/calendar.ics` *(Caller session or Admin scoped)*
+Streams an RFC-5545 `text/calendar` `.ics` invite for the appointment. Callers may download invites only for appointments created in their own `sessionId`; admins may download within `allowedTenants`.
+
+### `GET /api/integrations?tenantId=...` & `POST /api/integrations/:id/retry` *(Admin scoped)*
+Lists durable outbound webhook delivery logs (`integration_deliveries`, `30`-day retention) signed with HMAC-SHA256 (`X-VaniVoice-Signature`) and allows manual re-dispatch of failed/pending deliveries. Tenant `webhookConfig.signingSecret` values are redacted (`configured` boolean + masked preview) in read responses.
+
+### `GET /api/metrics/operational?tenantId=...` *(Admin scoped)*
+Returns real-time FDE operational KPIs (`computeOperationalMetrics`), including total calls, containment rate, safety/escalation rate, tool confirmation rate, webhook delivery health, median/P95 response latencies, and language distribution.
 
 ### `GET /api/audit-logs?tenantId=...` *(Admin scoped)*
 Returns up to 100 latest trace-correlated operational audit events (`traceId`, `actorId`, `actorRole`, `action`, `tenantId`, `targetId`, `metadata`).

@@ -93,6 +93,13 @@ export const TenantConfigSchema = z.object({
     phone: z.string().trim().min(3).max(40),
     email: z.string().trim().email().max(140),
   }),
+  webhookConfig: z.object({
+    enabled: z.boolean().default(false),
+    url: z.string().trim().max(500).default(''),
+    providerType: z.enum(['clinic_ehr_webhook', 'logistics_webhook', 'generic_webhook']).default('clinic_ehr_webhook'),
+    secretHeaderName: z.string().trim().min(1).max(80).default('X-VaniVoice-Signature'),
+    signingSecret: z.string().trim().max(256).optional(),
+  }).optional(),
 });
 
 export const CallLogCreateSchema = z.object({
@@ -146,4 +153,17 @@ export const HandoffUpdateSchema = z.object({
 
 export const AppointmentUpdateSchema = z.object({
   status: z.enum(['confirmed', 'cancelled']),
+});
+
+export const FirebaseAuthExchangeSchema = z.object({
+  idToken: z.string().trim().min(20).max(8192),
+});
+
+export const UserRoleUpdateSchema = z.object({
+  role: z.enum(['caller', 'tenant_admin', 'super_admin']),
+  allowedTenants: z.array(z.string().trim().min(1).max(80)).max(20).optional(),
+});
+
+export const UserRevokeUpdateSchema = z.object({
+  revoked: z.boolean(),
 });

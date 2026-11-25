@@ -1,6 +1,8 @@
 import React, { useState } from 'react';
 import { Lock, ShieldCheck, KeyRound, UserPlus, LogIn, AlertCircle, X } from 'lucide-react';
 import type { AuthUser } from '../types';
+import { signInWithGoogleOidc } from '../lib/firebase';
+import { upsertUserProfileInFirestore } from '../lib/firestoreStore';
 
 interface AdminAuthPanelProps {
   adminBootstrapNeeded: boolean;
@@ -18,7 +20,7 @@ export const AdminAuthPanel: React.FC<AdminAuthPanelProps> = ({
   passcodeConfigured,
   onAuthenticated,
   title = 'Workspace Administrator Access',
-  subtitle = 'Protected multi-tenant controls require a signed server session.',
+  subtitle = 'Sign in with Google OIDC or your workspace administrator credentials.',
   onClose,
 }) => {
   const [name, setName] = useState('Workspace Admin');
@@ -26,11 +28,55 @@ export const AdminAuthPanel: React.FC<AdminAuthPanelProps> = ({
   const [password, setPassword] = useState('');
   const [bootstrapToken, setBootstrapToken] = useState('');
   const [loading, setLoading] = useState(false);
+  const [googleLoading, setGoogleLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [infoMsg, setInfoMsg] = useState<string | null>(null);
+
+  const handleGoogleSignIn = async () => {
+    setErrorMsg(null);
+    setInfoMsg(null);
+    setGoogleLoading(true);
+
+    try {
+      const { user: fbUser, idToken } = await signInWithGoogleOidc();
+      const res = await fetch('/api/auth/firebase', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ idToken }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.token || !data.user) {
+        setErrorMsg(data.error || 'Google sign-in could not be verified by server.');
+        return;
+      }
+
+      // Sync verified OIDC profile to Firestore (non-blocking)
+      void upsertUserProfileInFirestore(data.user, fbUser.uid);
+
+      if (data.user.role === 'caller') {
+        setInfoMsg(
+          `Signed in as ${data.user.email} (caller role). Ask the workspace super-admin to promote this account if admin permissions are needed.`
+        );
+      }
+      onAuthenticated(data.token, data.user);
+    } catch (err: any) {
+      const code = String(err?.code || '');
+      if (code === 'auth/popup-closed-by-user') {
+        setErrorMsg('Google sign-in window was closed before completion.');
+      } else if (code === 'auth/popup-blocked') {
+        setErrorMsg('Popup blocked by browser. Allow popups for this site and try again.');
+      } else {
+        setErrorMsg(err instanceof Error ? err.message : 'Google sign-in failed.');
+      }
+    } finally {
+      setGoogleLoading(false);
+    }
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMsg(null);
+    setInfoMsg(null);
     setLoading(true);
 
     try {
@@ -87,12 +133,54 @@ export const AdminAuthPanel: React.FC<AdminAuthPanelProps> = ({
         )}
       </div>
 
+      {/* Primary Google OIDC Sign-In */}
+      <button
+        type="button"
+        onClick={handleGoogleSignIn}
+        disabled={googleLoading || loading}
+        className="w-full py-2.5 px-4 rounded-xl bg-white text-slate-900 hover:bg-slate-100 disabled:opacity-50 font-semibold text-xs flex items-center justify-center gap-2.5 shadow-sm transition cursor-pointer"
+      >
+        <svg className="w-4 h-4 shrink-0" viewBox="0 0 24 24" aria-hidden="true">
+          <path
+            fill="#4285F4"
+            d="M23.745 12.27c0-.7-.06-1.4-.19-2.07H12v4.51h6.6c-.29 1.52-1.14 2.82-2.4 3.68v3.05h3.88c2.27-2.09 3.665-5.17 3.665-9.17Z"
+          />
+          <path
+            fill="#34A853"
+            d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.88-3.05c-1.08.72-2.45 1.16-4.05 1.16-3.12 0-5.77-2.11-6.72-4.96H1.29v3.14C3.26 21.3 7.31 24 12 24Z"
+          />
+          <path
+            fill="#FBBC05"
+            d="M5.28 14.24c-.24-.72-.38-1.49-.38-2.24s.14-1.52.38-2.24V6.62H1.29C.47 8.24 0 10.06 0 12s.47 3.76 1.29 5.38l3.99-3.14Z"
+          />
+          <path
+            fill="#EA4335"
+            d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.31 0 3.26 2.7 1.29 6.62l3.99 3.14c.95-2.85 3.6-4.96 6.72-4.96Z"
+          />
+        </svg>
+        <span>{googleLoading ? 'Connecting Google Account...' : 'Sign in with Google'}</span>
+      </button>
+
+      <div className="relative flex items-center py-0.5">
+        <div className="flex-grow border-t border-white/[0.08]" />
+        <span className="shrink mx-3 text-[10px] font-mono uppercase tracking-wider text-slate-500">
+          Or Workspace Credentials
+        </span>
+        <div className="flex-grow border-t border-white/[0.08]" />
+      </div>
+
       {adminBootstrapNeeded && (
         <div className="p-3 rounded-xl bg-emerald-950/30 border border-emerald-500/30 text-[11px] text-emerald-200 flex items-start gap-2">
           <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
           <span>
             <strong>First-Run Setup:</strong> No workspace administrator has been claimed yet. Set your initial admin credentials below (hashed with salted <code>scrypt</code> on the server).
           </span>
+        </div>
+      )}
+
+      {infoMsg && (
+        <div className="p-3 rounded-xl bg-indigo-950/40 border border-indigo-500/30 text-xs text-indigo-200">
+          {infoMsg}
         </div>
       )}
 
@@ -172,7 +260,7 @@ export const AdminAuthPanel: React.FC<AdminAuthPanelProps> = ({
 
         <button
           type="submit"
-          disabled={loading}
+          disabled={loading || googleLoading}
           className="w-full py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white font-bold flex items-center justify-center gap-2 transition cursor-pointer"
         >
           {adminBootstrapNeeded ? <UserPlus className="w-4 h-4" /> : <LogIn className="w-4 h-4" />}
@@ -181,7 +269,7 @@ export const AdminAuthPanel: React.FC<AdminAuthPanelProps> = ({
               ? 'Verifying...'
               : adminBootstrapNeeded
               ? 'Claim Workspace Admin'
-              : 'Sign In as Admin'}
+              : 'Sign In with Password'}
           </span>
         </button>
       </form>

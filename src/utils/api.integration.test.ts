@@ -4,7 +4,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn, type ChildProcess } from 'node:child_process';
+import http from 'node:http';
 import net from 'node:net';
+import { verifyWebhookSignature } from './externalIntegration.ts';
 
 const REPO_ROOT = process.cwd();
 const SERVER_ENTRY = path.join(REPO_ROOT, 'server.ts');
@@ -364,3 +366,226 @@ test('Integration: Production server boots with bootstrap token, enforces clinic
     fs.rmSync(workdir, { recursive: true, force: true });
   }
 });
+
+test('Integration: Outbound webhook dispatch retries failed attempts with HMAC signature, serves .ics invites, computes metrics, and enforces immediate user revocation', async () => {
+  const workdir = makeTempWorkdir();
+  const port = await getFreePort();
+  const baseUrl = `http://127.0.0.1:${port}`;
+  const sessionSecret = '0123456789abcdef0123456789abcdef0123456789abcdef';
+  const bootstrapToken = 'boot-token-webhook-test-123';
+  const webhookSecret = 'clinic-ehr-hmac-secret-999';
+
+  // Local ephemeral EHR webhook receiver: fails 1st call (HTTP 500), succeeds 2nd call (HTTP 200) unless ?mode=fail
+  let attemptsReceived = 0;
+  let forceFail = false;
+  const receivedEvents: { headers: http.IncomingHttpHeaders; body: string }[] = [];
+
+  const webhookServer = http.createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on('data', c => chunks.push(c));
+    req.on('end', () => {
+      attemptsReceived += 1;
+      const body = Buffer.concat(chunks).toString('utf8');
+      if (forceFail || attemptsReceived === 1) {
+        res.statusCode = 500;
+        res.end(JSON.stringify({ error: 'temporary upstream error' }));
+        return;
+      }
+      receivedEvents.push({ headers: req.headers, body });
+      res.statusCode = 200;
+      res.end(JSON.stringify({ ok: true }));
+    });
+  });
+
+  await new Promise<void>(resolve => webhookServer.listen(0, '127.0.0.1', () => resolve()));
+  const webhookAddr = webhookServer.address();
+  const webhookPort = typeof webhookAddr === 'object' && webhookAddr ? webhookAddr.port : 0;
+  const webhookUrl = `http://127.0.0.1:${webhookPort}/ehr-events`;
+
+  const proc = spawn(process.execPath, [SERVER_ENTRY], {
+    cwd: workdir,
+    env: {
+      ...process.env,
+      NODE_ENV: 'production',
+      PORT: String(port),
+      SESSION_SECRET: sessionSecret,
+      ADMIN_BOOTSTRAP_TOKEN: bootstrapToken,
+      ADMIN_PASSCODE: '',
+      GEMINI_API_KEY: '',
+      ALLOW_LOCAL_WEBHOOKS: 'true',
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  const stderrChunks: string[] = [];
+  proc.stderr?.on('data', d => stderrChunks.push(d.toString()));
+
+  try {
+    await waitForHealth(baseUrl, proc, stderrChunks);
+
+    const bootRes = await fetch(`${baseUrl}/api/auth/bootstrap`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Clinic Admin',
+        email: 'admin@kalinga.org',
+        password: 'StrongPassword123!',
+        bootstrapToken,
+      }),
+    });
+    const adminAuth = (await bootRes.json()) as any;
+    const adminHeaders = {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${adminAuth.token}`,
+    };
+
+    // 1. Configure tenant webhook on kalinga_clinic
+    const tenantRes = await fetch(`${baseUrl}/api/tenants/kalinga_clinic`, { headers: adminHeaders });
+    const tenant = (await tenantRes.json()) as any;
+    tenant.webhookConfig = {
+      enabled: true,
+      url: webhookUrl,
+      providerType: 'clinic_ehr_webhook',
+      secretHeaderName: 'X-VaniVoice-Signature',
+      signingSecret: webhookSecret,
+    };
+    const saveRes = await fetch(`${baseUrl}/api/tenants/kalinga_clinic`, {
+      method: 'POST',
+      headers: adminHeaders,
+      body: JSON.stringify(tenant),
+    });
+    assert.strictEqual(saveRes.status, 200);
+
+    // 2. Book appointment as caller -> webhook auto-retries 500 -> 200 with valid HMAC signature
+    const callerRes = await fetch(`${baseUrl}/api/auth/caller-session`, { method: 'POST' });
+    const callerAuth = (await callerRes.json()) as any;
+    const callerHeaders = {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${callerAuth.token}`,
+    };
+
+    const step1 = (await (await fetch(`${baseUrl}/api/turn`, {
+      method: 'POST',
+      headers: callerHeaders,
+      body: JSON.stringify({
+        tenantId: 'kalinga_clinic',
+        userText: 'Book appointment with Dr. Jena at 11:30 AM. My name is Ananya',
+        language: 'en',
+        demoMode: true,
+      }),
+    })).json()) as any;
+
+    const confirmRes = (await (await fetch(`${baseUrl}/api/turn`, {
+      method: 'POST',
+      headers: callerHeaders,
+      body: JSON.stringify({
+        tenantId: 'kalinga_clinic',
+        userText: 'Yes confirm please',
+        language: 'en',
+        memory: step1.memoryUpdates,
+        demoMode: true,
+      }),
+    })).json()) as any;
+
+    const bookingRef = confirmRes.toolCalls?.[0]?.result?.data?.bookingRef;
+    assert.ok(bookingRef);
+    assert.ok(attemptsReceived >= 2, 'Expected automatic retry after HTTP 500');
+    assert.strictEqual(receivedEvents.length, 1);
+    const sigHeader = String(receivedEvents[0].headers['x-vanivoice-signature'] || '');
+    assert.strictEqual(verifyWebhookSignature(webhookSecret, sigHeader, receivedEvents[0].body), true);
+
+    // 3. Check .ics endpoint for owner vs unauthorized second caller
+    const icsRes = await fetch(`${baseUrl}/api/appointments/${bookingRef}/calendar.ics`, { headers: callerHeaders });
+    assert.strictEqual(icsRes.status, 200);
+    const icsBody = await icsRes.text();
+    assert.ok(icsBody.includes('BEGIN:VCALENDAR'));
+    assert.ok(icsBody.includes(bookingRef));
+
+    const otherCaller = (await (await fetch(`${baseUrl}/api/auth/caller-session`, { method: 'POST' })).json()) as any;
+    const forbiddenIcs = await fetch(`${baseUrl}/api/appointments/${bookingRef}/calendar.ics`, {
+      headers: { Authorization: `Bearer ${otherCaller.token}` },
+    });
+    assert.strictEqual(forbiddenIcs.status, 403);
+
+    // 4. Test permanent webhook failure + manual Retry button endpoint
+    forceFail = true;
+    const emergencyTurn = await fetch(`${baseUrl}/api/turn`, {
+      method: 'POST',
+      headers: callerHeaders,
+      body: JSON.stringify({
+        tenantId: 'kalinga_clinic',
+        userText: 'Emergency chest pain help!',
+        language: 'en',
+        demoMode: true,
+      }),
+    });
+    assert.strictEqual(emergencyTurn.status, 200);
+
+    const deliveries = (await (await fetch(`${baseUrl}/api/integrations`, { headers: adminHeaders })).json()) as any[];
+    const failedDel = deliveries.find(d => d.status === 'failed' && d.eventType === 'handoff.created');
+    assert.ok(failedDel, 'Expected failed handoff.created webhook record');
+
+    forceFail = false;
+    const retryRes = await fetch(`${baseUrl}/api/integrations/${failedDel.id}/retry`, {
+      method: 'POST',
+      headers: adminHeaders,
+    });
+    assert.strictEqual(retryRes.status, 200);
+    const retryData = (await retryRes.json()) as any;
+    assert.strictEqual(retryData.delivery.status, 'delivered');
+
+    // 5. Verify /api/metrics/operational computes real values
+    const metricsRes = await fetch(`${baseUrl}/api/metrics/operational`, { headers: adminHeaders });
+    assert.strictEqual(metricsRes.status, 200);
+    const metrics = (await metricsRes.json()) as any;
+    assert.ok(metrics.confirmedAppointments >= 1);
+    assert.ok(metrics.deliveredCount >= 2);
+    assert.strictEqual(metrics.webhookSuccessRatePct, 100);
+
+    // 6. Create tenant admin user, sign in, then revoke -> existing token rejected immediately
+    const createUserRes = await fetch(`${baseUrl}/api/auth/users`, {
+      method: 'POST',
+      headers: adminHeaders,
+      body: JSON.stringify({
+        name: 'Kalinga Operator',
+        email: 'operator@kalinga.org',
+        password: 'OperatorPass123!',
+        role: 'tenant_admin',
+        allowedTenants: ['kalinga_clinic'],
+      }),
+    });
+    assert.strictEqual(createUserRes.status, 201);
+    const createdUser = (await createUserRes.json()) as any;
+
+    const opLoginRes = await fetch(`${baseUrl}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'operator@kalinga.org', password: 'OperatorPass123!' }),
+    });
+    assert.strictEqual(opLoginRes.status, 200);
+    const opAuth = (await opLoginRes.json()) as any;
+
+    const okBeforeRevoke = await fetch(`${baseUrl}/api/appointments`, {
+      headers: { Authorization: `Bearer ${opAuth.token}` },
+    });
+    assert.strictEqual(okBeforeRevoke.status, 200);
+
+    const revokeRes = await fetch(`${baseUrl}/api/auth/users/${createdUser.user.id}/revoke`, {
+      method: 'POST',
+      headers: adminHeaders,
+      body: JSON.stringify({ revoked: true }),
+    });
+    assert.strictEqual(revokeRes.status, 200);
+
+    const rejectedAfterRevoke = await fetch(`${baseUrl}/api/appointments`, {
+      headers: { Authorization: `Bearer ${opAuth.token}` },
+    });
+    assert.strictEqual(rejectedAfterRevoke.status, 401, 'Revoked user token must fail immediately on next request');
+  } finally {
+    webhookServer.close();
+    proc.kill('SIGTERM');
+    await new Promise(resolve => proc.once('exit', resolve));
+    fs.rmSync(workdir, { recursive: true, force: true });
+  }
+});
+

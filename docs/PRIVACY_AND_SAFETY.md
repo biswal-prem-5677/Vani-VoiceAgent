@@ -23,15 +23,19 @@ Every incoming turn in `POST /api/turn` runs `checkEmergencyCondition(userText, 
 - **Explicit Consent & Retention Enforcement (`ConsentBanner.tsx`, `/api/consent`, `/api/logs`)**:
   - Call transcript retention options: `7`, `30`, `90`, or `0` days (`Delete on call end`).
   - Choosing **Ephemeral Only** (`consented: false`) or `0` days deletes any stored logs for the current session immediately and prevents `POST /api/logs` from writing transcripts to SQLite (`persisted: false`).
-- **Safety, Support & Appointment Retention Policy**:
-  - **Safety / Handoff Tickets (`handoff_tickets`)**: Auto-expire after **30 days**.
+- **Safety, Support, Appointment & Webhook Retention Policy**:
+  - **Safety / Handoff Tickets (`handoff_tickets`) & Webhook Deliveries (`integration_deliveries`)**: Auto-expire after **30 days**.
   - **Support Desk Tickets (`support_tickets`) & Clinic Appointments (`appointments`)**: Auto-expire after **90 days**.
   - **Stale Pending Confirmations (`pending_actions`)**: Expire after **24 hours**.
   - An automated background worker sweeps expired rows across all tables on startup and every 15 minutes.
+- **Outbound Webhook SSRF Guard & Signed Payloads**:
+  - Tenant webhook targets are validated by `validateOutboundWebhookUrl()` to block loopback (`127.0.0.1`, `localhost`, `::1`), cloud metadata endpoints (`169.254.169.254`), and RFC1918 private networks (`10.x`, `172.16-31.x`, `192.168.x`) unless `ALLOW_LOCAL_WEBHOOKS=true` is explicitly enabled. Payloads are signed with HMAC-SHA256 (`X-VaniVoice-Signature`), and tenant `signingSecret` values are redacted from read endpoints.
 - **Complete Session-Scoped Deletion (`LegalModal.tsx`, `DELETE /api/session/data`)**:
-  - Callers can permanently erase all **call logs, safety handoff tickets, support tickets, appointments, consent records, and pending confirmations** tied to their active `sessionId`.
+  - Callers can permanently erase all **call logs, safety handoff tickets, support tickets, appointments, outbound webhook deliveries, consent records, and pending confirmations** tied to their active `sessionId`.
   - `DELETE /api/logs/all`: Authorized admins erase logs only within `allowedTenants`.
   - `POST /api/user/wipe-all`: Restricted exclusively to `super_admin`; wipes all operational tables and restores default demo tenants.
-- **Traceability & Secrets**:
-  - Every response carries an `X-Trace-Id` header and operational mutations are recorded in SQLite `audit_logs`.
-  - Bearer tokens remain strictly in React memory (`App.tsx`) and `GEMINI_API_KEY`, `SESSION_SECRET`, `ADMIN_BOOTSTRAP_TOKEN`, and `ADMIN_PASSCODE` remain strictly server-side.
+- **Access Revocation, Traceability & Firestore Rules**:
+  - Role edits and user revocations (`POST /api/auth/users/:id/revoke`) take effect immediately on the next API request because SQLite `users` is re-checked server-side on every authenticated call.
+  - Every response carries an `X-Trace-Id` header and operational mutations are recorded in `audit_logs`.
+  - Cloud Firestore collections are protected by Eight-Pillar `firestore.rules` (owner-only/admin-only queries and role validation, tested via `firestore.rules.test.ts`).
+  - Bearer tokens remain strictly in React memory (`App.tsx`), never `localStorage`/`sessionStorage`, and `GEMINI_API_KEY`, `SESSION_SECRET`, `ADMIN_BOOTSTRAP_TOKEN`, `ADMIN_PASSCODE`, and `WEBHOOK_SIGNING_SECRET` remain strictly server-side.

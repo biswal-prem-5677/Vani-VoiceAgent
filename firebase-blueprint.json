@@ -1,0 +1,194 @@
+{
+  "entities": {
+    "AdminEntry": {
+      "title": "Admin Entry",
+      "description": "Authorized workspace administrator record keyed by Firebase UID",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "email": { "type": "string", "format": "email", "maxLength": 160 },
+        "role": { "type": "string", "enum": ["super_admin", "tenant_admin"] },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "email", "role", "createdAt"]
+    },
+    "UserProfile": {
+      "title": "User Profile",
+      "description": "OIDC-authenticated user profile and tenant role metadata",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "email": { "type": "string", "format": "email", "maxLength": 160 },
+        "displayName": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "role": { "type": "string", "enum": ["caller", "tenant_admin", "super_admin"] },
+        "revoked": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "email", "displayName", "role", "revoked", "createdAt", "updatedAt"]
+    },
+    "TenantWorkspace": {
+      "title": "Tenant Workspace",
+      "description": "Tenant configuration summary and webhook settings synced to Firestore",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 2, "maxLength": 80, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "name": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "category": { "type": "string", "enum": ["clinic", "coaching", "logistics", "university", "custom"] },
+        "agentName": { "type": "string", "minLength": 1, "maxLength": 60 },
+        "webhookEnabled": { "type": "boolean" },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "name", "category", "agentName", "ownerUid", "updatedAt"]
+    },
+    "CallSession": {
+      "title": "Call Session",
+      "description": "Consented voice session record owned by an authenticated user",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 3, "maxLength": 100, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "tenantId": { "type": "string", "minLength": 1, "maxLength": 80, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "tenantName": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "detectedIntent": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "durationSeconds": { "type": "number" },
+        "averageLatencyMs": { "type": "number" },
+        "p95LatencyMs": { "type": "number" },
+        "taskCompleted": { "type": "boolean" },
+        "handedOffToHuman": { "type": "boolean" },
+        "retentionDays": { "type": "number" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "id",
+        "ownerUid",
+        "tenantId",
+        "tenantName",
+        "detectedIntent",
+        "durationSeconds",
+        "taskCompleted",
+        "handedOffToHuman",
+        "retentionDays",
+        "createdAt"
+      ]
+    },
+    "HandoffTicketDoc": {
+      "title": "Handoff Ticket",
+      "description": "Human callback or emergency escalation ticket",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 3, "maxLength": 100, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "tenantId": { "type": "string", "minLength": 1, "maxLength": 80, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "reason": { "type": "string", "minLength": 1, "maxLength": 300 },
+        "priority": { "type": "string", "enum": ["critical", "high", "normal"] },
+        "summary": { "type": "string", "minLength": 1, "maxLength": 1000 },
+        "status": { "type": "string", "enum": ["queued", "acknowledged", "resolved"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerUid", "tenantId", "reason", "priority", "summary", "status", "createdAt", "updatedAt"]
+    },
+    "AppointmentDoc": {
+      "title": "Appointment Record",
+      "description": "Confirmed or cancelled clinic appointment record",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 3, "maxLength": 100, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "tenantId": { "type": "string", "minLength": 1, "maxLength": 80, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "doctor": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "slot": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "patientName": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "status": { "type": "string", "enum": ["confirmed", "cancelled"] },
+        "actionId": { "type": "string", "minLength": 3, "maxLength": 100 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerUid", "tenantId", "doctor", "slot", "patientName", "status", "actionId", "createdAt"]
+    },
+    "IntegrationDeliveryDoc": {
+      "title": "Integration Delivery",
+      "description": "Outbound webhook delivery log with retry and status state",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 3, "maxLength": 100, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "tenantId": { "type": "string", "minLength": 1, "maxLength": 80, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "eventType": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "status": { "type": "string", "enum": ["pending", "delivered", "failed", "not_configured"] },
+        "attemptCount": { "type": "number" },
+        "idempotencyKey": { "type": "string", "minLength": 3, "maxLength": 120 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerUid", "tenantId", "eventType", "status", "attemptCount", "idempotencyKey", "createdAt", "updatedAt"]
+    },
+    "AuditEventDoc": {
+      "title": "Audit Event",
+      "description": "Immutable administrative audit trail record",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 3, "maxLength": 100, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "traceId": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "actorUid": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "action": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "tenantId": { "type": "string", "maxLength": 80 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "traceId", "actorUid", "action", "createdAt"]
+    },
+    "SupportTicketDoc": {
+      "title": "Support Ticket",
+      "description": "Customer engineering support desk ticket",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 3, "maxLength": 100, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "subject": { "type": "string", "minLength": 1, "maxLength": 180 },
+        "message": { "type": "string", "minLength": 1, "maxLength": 3000 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerUid", "name", "subject", "message", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/admins/{uid}": {
+      "schema": { "$ref": "#/entities/AdminEntry" },
+      "description": "Workspace administrator allowlist keyed by Firebase Auth UID"
+    },
+    "/users/{uid}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "User profile records isolated to owner or super admin"
+    },
+    "/tenants/{tenantId}": {
+      "schema": { "$ref": "#/entities/TenantWorkspace" },
+      "description": "Multi-tenant configuration synced for authorized workspace admins"
+    },
+    "/callSessions/{sessionId}": {
+      "schema": { "$ref": "#/entities/CallSession" },
+      "description": "Consented voice session transcripts and latency telemetry"
+    },
+    "/handoffs/{ticketId}": {
+      "schema": { "$ref": "#/entities/HandoffTicketDoc" },
+      "description": "Safety and human callback handoff tickets"
+    },
+    "/appointments/{appointmentId}": {
+      "schema": { "$ref": "#/entities/AppointmentDoc" },
+      "description": "Clinic appointment ledger records"
+    },
+    "/integrations/{deliveryId}": {
+      "schema": { "$ref": "#/entities/IntegrationDeliveryDoc" },
+      "description": "Outbound clinic/EHR webhook delivery status records"
+    },
+    "/auditLogs/{logId}": {
+      "schema": { "$ref": "#/entities/AuditEventDoc" },
+      "description": "Trace-correlated audit trail records"
+    },
+    "/supportTickets/{ticketId}": {
+      "schema": { "$ref": "#/entities/SupportTicketDoc" },
+      "description": "Support ticket submissions scoped to creator or admin"
+    }
+  }
+}

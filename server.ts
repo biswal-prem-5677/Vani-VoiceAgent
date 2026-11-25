@@ -52,7 +52,19 @@ import {
   HandoffUpdateSchema,
   AppointmentUpdateSchema,
 } from './src/utils/schemas.ts';
-import type { TenantConfig, CallLog, HandoffTicket, SupportedLanguage } from './src/types/index.ts';
+import {
+  FirebaseAuthExchangeSchema,
+  UserRoleUpdateSchema,
+  UserRevokeUpdateSchema,
+} from './src/utils/schemas.ts';
+import { verifyFirebaseIdToken } from './src/lib/firebase-admin.ts';
+import {
+  validateOutboundWebhookUrl,
+  dispatchWebhookWithRetry,
+  buildCalendarIcs,
+} from './src/utils/externalIntegration.ts';
+import { computeOperationalMetrics } from './src/utils/operationalMetrics.ts';
+import type { TenantConfig, CallLog, HandoffTicket, SupportedLanguage, IntegrationDelivery } from './src/types/index.ts';
 
 const app = express();
 app.set('trust proxy', 1);
@@ -62,6 +74,9 @@ const isDev = process.argv.includes('--dev') || process.env.NODE_ENV === 'develo
 const RAW_SESSION_SECRET = process.env.SESSION_SECRET?.trim() || '';
 const ADMIN_PASSCODE = process.env.ADMIN_PASSCODE?.trim() || '';
 const ADMIN_BOOTSTRAP_TOKEN = process.env.ADMIN_BOOTSTRAP_TOKEN?.trim() || '';
+const ADMIN_EMAIL = (process.env.ADMIN_EMAIL?.trim() || 'priyabratabiswal567@gmail.com').toLowerCase();
+const ALLOW_LOCAL_WEBHOOKS = process.env.ALLOW_LOCAL_WEBHOOKS === 'true';
+const WEBHOOK_SIGNING_SECRET = process.env.WEBHOOK_SIGNING_SECRET?.trim() || '';
 
 // Security headers & X-Trace-Id propagation (iframe-compatible for preview environments)
 app.use((req: Request & { traceId?: string }, res: Response, next: NextFunction) => {
@@ -208,6 +223,24 @@ db.exec(`
     metadata TEXT NOT NULL,
     created_at INTEGER NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS integration_deliveries (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    session_id TEXT,
+    event_type TEXT NOT NULL,
+    target_url TEXT NOT NULL,
+    status TEXT NOT NULL,
+    attempt_count INTEGER NOT NULL,
+    last_status_code INTEGER,
+    last_error TEXT,
+    latency_ms INTEGER,
+    idempotency_key TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    expires_at INTEGER
+  );
 `);
 
 // Safe additive column migrations for pre-existing local SQLite databases
@@ -224,6 +257,8 @@ ensureColumn('support_tickets', 'tenant_id', 'TEXT');
 ensureColumn('support_tickets', 'session_id', 'TEXT');
 ensureColumn('support_tickets', 'expires_at', 'INTEGER');
 ensureColumn('handoff_tickets', 'expires_at', 'INTEGER');
+ensureColumn('users', 'revoked', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('users', 'auth_provider', "TEXT NOT NULL DEFAULT 'workspace_local'");
 
 // Backfill retention expiry for any pre-existing safety/support tickets missing expires_at
 db.prepare('UPDATE handoff_tickets SET expires_at = created_at + ? WHERE expires_at IS NULL').run(
@@ -247,6 +282,8 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_appointments_tenant_doc ON appointments(tenant_id, doctor, status);
   CREATE INDEX IF NOT EXISTS idx_appointments_session_id ON appointments(session_id);
   CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at);
+  CREATE INDEX IF NOT EXISTS idx_integrations_tenant_id ON integration_deliveries(tenant_id, created_at);
+  CREATE INDEX IF NOT EXISTS idx_integrations_session_id ON integration_deliveries(session_id);
 `);
 
 function hasSuperAdminAccount(): boolean {
@@ -306,6 +343,7 @@ function purgeExpiredRecords(): number {
     total += Number(db.prepare('DELETE FROM handoff_tickets WHERE expires_at IS NOT NULL AND expires_at <= ?').run(now).changes || 0);
     total += Number(db.prepare('DELETE FROM support_tickets WHERE expires_at IS NOT NULL AND expires_at <= ?').run(now).changes || 0);
     total += Number(db.prepare('DELETE FROM appointments WHERE expires_at IS NOT NULL AND expires_at <= ?').run(now).changes || 0);
+    total += Number(db.prepare('DELETE FROM integration_deliveries WHERE expires_at IS NOT NULL AND expires_at <= ?').run(now).changes || 0);
     total += Number(db.prepare("DELETE FROM pending_actions WHERE status = 'pending' AND created_at <= ?").run(stalePendingCutoff).changes || 0);
     return total;
   } catch {
@@ -391,22 +429,101 @@ if (GEMINI_API_KEY) {
 }
 
 // -------------------------------------------------------------
-// 4. Auth & Tenant Helpers
+// 4. Auth, Firebase OIDC, Live Revocation & Webhook Helpers
 // -------------------------------------------------------------
 interface AuthenticatedRequest extends Request {
   authUser?: SessionTokenPayload;
   traceId?: string;
 }
 
-function getAuthUser(req: Request): SessionTokenPayload | null {
+interface DbUserRow {
+  id: string;
+  email: string;
+  name: string;
+  role: 'caller' | 'tenant_admin' | 'super_admin';
+  allowed_tenants: string;
+  revoked: number;
+  auth_provider: string;
+}
+
+function upsertFirebaseUserRecord(claims: { uid: string; email: string; name: string }): DbUserRow | null {
+  const existing = db
+    .prepare('SELECT id, email, name, role, allowed_tenants, revoked, auth_provider FROM users WHERE email = ? OR id = ?')
+    .get(claims.email.toLowerCase(), `fb_${claims.uid}`) as DbUserRow | undefined;
+
+  if (existing) {
+    if (existing.revoked === 1) return existing;
+    return existing;
+  }
+
+  const isPrimaryAdmin = claims.email.toLowerCase() === ADMIN_EMAIL;
+  const role: DbUserRow['role'] = isPrimaryAdmin ? 'super_admin' : 'caller';
+  const allowedTenantsJson = JSON.stringify(isPrimaryAdmin ? ['*'] : []);
+  const id = `fb_${claims.uid}`;
+  db.prepare(
+    'INSERT INTO users (id, email, name, role, allowed_tenants, password_hash, revoked, auth_provider, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+  ).run(id, claims.email.toLowerCase(), claims.name, role, allowedTenantsJson, 'oidc_federated', 0, 'firebase_oidc', Date.now());
+
+  return {
+    id,
+    email: claims.email.toLowerCase(),
+    name: claims.name,
+    role,
+    allowed_tenants: allowedTenantsJson,
+    revoked: 0,
+    auth_provider: 'firebase_oidc',
+  };
+}
+
+async function resolveAuthUser(req: Request): Promise<SessionTokenPayload | null> {
   const header = req.headers.authorization;
   if (!header || !header.startsWith('Bearer ')) return null;
   const token = header.slice(7).trim();
-  return verifySessionToken(token, SESSION_SECRET);
+
+  // 1. Check workspace-signed session token first (fast HMAC path)
+  const localClaims = verifySessionToken(token, SESSION_SECRET);
+  if (localClaims) {
+    // Re-read live DB role & revocation status on every request so role/revocation changes take immediate effect
+    if (localClaims.sub !== 'usr_env_admin' && (localClaims.sub.startsWith('usr_') || localClaims.sub.startsWith('fb_'))) {
+      const row = db
+        .prepare('SELECT id, email, name, role, allowed_tenants, revoked FROM users WHERE id = ?')
+        .get(localClaims.sub) as DbUserRow | undefined;
+      if (row) {
+        if (row.revoked === 1) return null;
+        return {
+          ...localClaims,
+          email: row.email,
+          name: row.name,
+          role: row.role,
+          allowedTenants: JSON.parse(row.allowed_tenants),
+        };
+      }
+    }
+    return localClaims;
+  }
+
+  // 2. Check Firebase OIDC ID token
+  const fbClaims = await verifyFirebaseIdToken(token);
+  if (!fbClaims) return null;
+
+  const userRow = upsertFirebaseUserRecord(fbClaims);
+  if (!userRow || userRow.revoked === 1) return null;
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  return {
+    sub: userRow.id,
+    sessionId: `fb_${fbClaims.uid}`,
+    email: userRow.email,
+    name: userRow.name,
+    role: userRow.role,
+    allowedTenants: JSON.parse(userRow.allowed_tenants),
+    iat: nowSec,
+    exp: nowSec + 3600,
+  };
 }
 
-function requireAuthenticated(req: AuthenticatedRequest, res: Response, next: NextFunction) {
-  const user = getAuthUser(req);
+async function requireAuthenticated(req: AuthenticatedRequest, res: Response, next: NextFunction) {
+  const user = await resolveAuthUser(req);
   if (!user) {
     return res.status(401).json({
       error: 'Authentication required. Initialize a caller session or sign in as workspace administrator.',
@@ -417,8 +534,8 @@ function requireAuthenticated(req: AuthenticatedRequest, res: Response, next: Ne
   return next();
 }
 
-function requireAdmin(req: AuthenticatedRequest, res: Response, next: NextFunction) {
-  const user = getAuthUser(req);
+async function requireAdmin(req: AuthenticatedRequest, res: Response, next: NextFunction) {
+  const user = await resolveAuthUser(req);
   if (!user) {
     return res.status(401).json({
       error: 'Administrator sign-in required for this endpoint.',
@@ -435,8 +552,8 @@ function requireAdmin(req: AuthenticatedRequest, res: Response, next: NextFuncti
   return next();
 }
 
-function requireSuperAdmin(req: AuthenticatedRequest, res: Response, next: NextFunction) {
-  const user = getAuthUser(req);
+async function requireSuperAdmin(req: AuthenticatedRequest, res: Response, next: NextFunction) {
+  const user = await resolveAuthUser(req);
   if (!user) {
     return res.status(401).json({
       error: 'Workspace administrator sign-in required.',
@@ -473,8 +590,142 @@ function toPublicTenantSummary(tenant: TenantConfig): TenantConfig {
       phone: tenant.humanHandoffContact.phone,
       email: 'Protected (sign in as admin)',
     },
+    webhookConfig: tenant.webhookConfig
+      ? {
+          enabled: tenant.webhookConfig.enabled,
+          providerType: tenant.webhookConfig.providerType,
+          url: tenant.webhookConfig.enabled ? '[Protected Webhook Endpoint]' : '',
+          secretHeaderName: tenant.webhookConfig.secretHeaderName,
+        }
+      : undefined,
     isPublicSummaryOnly: true,
   };
+}
+
+function toSafeAdminTenant(tenant: TenantConfig): TenantConfig {
+  if (!tenant.webhookConfig) return tenant;
+  return {
+    ...tenant,
+    webhookConfig: {
+      ...tenant.webhookConfig,
+      signingSecret: tenant.webhookConfig.signingSecret ? '********' : undefined,
+    },
+  };
+}
+
+async function enqueueAndDispatchWebhook(params: {
+  tenant: TenantConfig;
+  sessionId?: string | null;
+  eventType: string;
+  payload: Record<string, unknown>;
+  idempotencyKey: string;
+}): Promise<IntegrationDelivery> {
+  const now = Date.now();
+  const expiresAt = now + RETENTION_POLICY_DAYS.appointmentDays * 24 * 60 * 60 * 1000;
+  const id = `del_${crypto.randomUUID().slice(0, 12)}`;
+  const cfg = params.tenant.webhookConfig;
+  const payloadJson = JSON.stringify({
+    eventType: params.eventType,
+    tenantId: params.tenant.id,
+    tenantName: params.tenant.name,
+    timestamp: new Date(now).toISOString(),
+    idempotencyKey: params.idempotencyKey,
+    data: params.payload,
+  });
+
+  if (!cfg || !cfg.enabled || !cfg.url?.trim()) {
+    const rec: IntegrationDelivery = {
+      id,
+      tenantId: params.tenant.id,
+      sessionId: params.sessionId || null,
+      eventType: params.eventType,
+      targetUrl: '',
+      status: 'not_configured',
+      attemptCount: 0,
+      lastStatusCode: null,
+      lastError: null,
+      latencyMs: null,
+      idempotencyKey: params.idempotencyKey,
+      createdAt: now,
+      updatedAt: now,
+    };
+    db.prepare(
+      `INSERT INTO integration_deliveries
+        (id, tenant_id, session_id, event_type, target_url, status, attempt_count, last_status_code, last_error, latency_ms, idempotency_key, payload_json, created_at, updated_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      rec.id,
+      rec.tenantId,
+      rec.sessionId ?? null,
+      rec.eventType,
+      rec.targetUrl,
+      rec.status,
+      rec.attemptCount,
+      null,
+      null,
+      null,
+      rec.idempotencyKey,
+      payloadJson,
+      now,
+      now,
+      expiresAt
+    );
+    return rec;
+  }
+
+  const secret = cfg.signingSecret || WEBHOOK_SIGNING_SECRET || SESSION_SECRET;
+  const outcome = await dispatchWebhookWithRetry({
+    targetUrl: cfg.url,
+    signingSecret: secret,
+    secretHeaderName: cfg.secretHeaderName,
+    payloadJson,
+    idempotencyKey: params.idempotencyKey,
+    allowLocal: ALLOW_LOCAL_WEBHOOKS,
+    maxAttempts: 3,
+    backoffMs: [0, 150, 350],
+    timeoutMs: 2500,
+  });
+
+  const updatedAt = Date.now();
+  const delivery: IntegrationDelivery = {
+    id,
+    tenantId: params.tenant.id,
+    sessionId: params.sessionId || null,
+    eventType: params.eventType,
+    targetUrl: cfg.url,
+    status: outcome.status,
+    attemptCount: outcome.attemptCount,
+    lastStatusCode: outcome.lastStatusCode,
+    lastError: outcome.lastError,
+    latencyMs: outcome.latencyMs,
+    idempotencyKey: params.idempotencyKey,
+    createdAt: now,
+    updatedAt,
+  };
+
+  db.prepare(
+    `INSERT INTO integration_deliveries
+      (id, tenant_id, session_id, event_type, target_url, status, attempt_count, last_status_code, last_error, latency_ms, idempotency_key, payload_json, created_at, updated_at, expires_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    delivery.id,
+    delivery.tenantId,
+    delivery.sessionId ?? null,
+    delivery.eventType,
+    delivery.targetUrl,
+    delivery.status,
+    delivery.attemptCount,
+    delivery.lastStatusCode,
+    delivery.lastError,
+    delivery.latencyMs,
+    delivery.idempotencyKey,
+    payloadJson,
+    now,
+    updatedAt,
+    expiresAt
+  );
+
+  return delivery;
 }
 
 function writeAuditLog(params: {
@@ -808,8 +1059,8 @@ function executeServerToolWithDurability(params: {
 // -------------------------------------------------------------
 // 5. Authentication & Session Endpoints
 // -------------------------------------------------------------
-app.get('/api/session', (req, res) => {
-  const user = getAuthUser(req);
+app.get('/api/session', async (req, res) => {
+  const user = await resolveAuthUser(req);
   const superAdminClaimed = hasSuperAdminAccount();
   res.json({
     authenticated: Boolean(user),
@@ -817,6 +1068,7 @@ app.get('/api/session', (req, res) => {
     adminBootstrapNeeded: !ADMIN_PASSCODE && !superAdminClaimed,
     bootstrapRequiresToken: Boolean(ADMIN_BOOTSTRAP_TOKEN),
     passcodeConfigured: Boolean(ADMIN_PASSCODE),
+    oidcEnabled: true,
     user: user
       ? {
           id: user.sub,
@@ -991,20 +1243,24 @@ app.post('/api/auth/login', authLimiter, (req: AuthenticatedRequest, res) => {
   }
 
   const row = db
-    .prepare('SELECT id, email, name, role, allowed_tenants, password_hash FROM users WHERE email = ?')
+    .prepare('SELECT id, email, name, role, allowed_tenants, password_hash, revoked FROM users WHERE email = ?')
     .get(email.toLowerCase()) as
     | {
         id: string;
         email: string;
         name: string;
-        role: 'tenant_admin' | 'super_admin';
+        role: 'tenant_admin' | 'super_admin' | 'caller';
         allowed_tenants: string;
         password_hash: string;
+        revoked: number;
       }
     | undefined;
 
   if (!row || !verifyPassword(password, row.password_hash)) {
     return res.status(401).json({ error: 'Invalid email or password.' });
+  }
+  if (row.revoked === 1) {
+    return res.status(403).json({ error: 'Your workspace access has been revoked by an administrator.', code: 'USER_REVOKED' });
   }
 
   const allowedTenants = JSON.parse(row.allowed_tenants) as string[];
@@ -1037,13 +1293,73 @@ app.post('/api/auth/login', authLimiter, (req: AuthenticatedRequest, res) => {
       email: row.email,
       role: row.role,
       allowedTenants,
+      authProvider: 'workspace_local',
+    },
+  });
+});
+
+app.post('/api/auth/firebase', authLimiter, async (req: AuthenticatedRequest, res) => {
+  const parsed = FirebaseAuthExchangeSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'Valid Firebase OIDC idToken is required.' });
+  }
+
+  const fbClaims = await verifyFirebaseIdToken(parsed.data.idToken);
+  if (!fbClaims) {
+    return res.status(401).json({ error: 'Invalid or unverified Google OIDC token.' });
+  }
+
+  const userRow = upsertFirebaseUserRecord(fbClaims);
+  if (!userRow) {
+    return res.status(500).json({ error: 'Failed to provision federated user record.' });
+  }
+  if (userRow.revoked === 1) {
+    return res.status(403).json({
+      error: 'Workspace access for this Google account has been revoked.',
+      code: 'USER_REVOKED',
+    });
+  }
+
+  const allowedTenants = JSON.parse(userRow.allowed_tenants) as string[];
+  const sessionId = `fb_${fbClaims.uid}`;
+  const token = signSessionToken(
+    {
+      sub: userRow.id,
+      sessionId,
+      email: userRow.email,
+      name: userRow.name,
+      role: userRow.role,
+      allowedTenants,
+    },
+    SESSION_SECRET
+  );
+
+  writeAuditLog({
+    req,
+    actorId: userRow.id,
+    actorRole: userRow.role,
+    action: 'auth.firebase_oidc',
+    targetId: userRow.id,
+    metadata: { email: userRow.email },
+  });
+
+  return res.json({
+    token,
+    user: {
+      id: userRow.id,
+      sessionId,
+      name: userRow.name,
+      email: userRow.email,
+      role: userRow.role,
+      allowedTenants,
+      authProvider: 'firebase_oidc',
     },
   });
 });
 
 app.get('/api/auth/users', requireSuperAdmin, (_req, res) => {
   const rows = db
-    .prepare('SELECT id, email, name, role, allowed_tenants, created_at FROM users ORDER BY created_at DESC')
+    .prepare('SELECT id, email, name, role, allowed_tenants, revoked, auth_provider, created_at FROM users ORDER BY created_at DESC')
     .all() as any[];
   res.json(
     rows.map(r => ({
@@ -1052,6 +1368,8 @@ app.get('/api/auth/users', requireSuperAdmin, (_req, res) => {
       name: r.name,
       role: r.role,
       allowedTenants: JSON.parse(r.allowed_tenants),
+      revoked: r.revoked === 1,
+      authProvider: r.auth_provider || 'workspace_local',
       createdAt: r.created_at,
     }))
   );
@@ -1068,8 +1386,8 @@ app.post('/api/auth/users', requireSuperAdmin, (req: AuthenticatedRequest, res) 
 
   try {
     db.prepare(
-      'INSERT INTO users (id, email, name, role, allowed_tenants, password_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
-    ).run(userId, email.toLowerCase(), name, role, JSON.stringify(allowedTenants), passwordHash, Date.now());
+      'INSERT INTO users (id, email, name, role, allowed_tenants, password_hash, revoked, auth_provider, created_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)'
+    ).run(userId, email.toLowerCase(), name, role, JSON.stringify(allowedTenants), passwordHash, 'workspace_local', Date.now());
     writeAuditLog({
       req,
       action: 'auth.user_created',
@@ -1078,23 +1396,92 @@ app.post('/api/auth/users', requireSuperAdmin, (req: AuthenticatedRequest, res) 
     });
     return res.status(201).json({
       success: true,
-      user: { id: userId, email: email.toLowerCase(), name, role, allowedTenants },
+      user: { id: userId, email: email.toLowerCase(), name, role, allowedTenants, revoked: false },
     });
   } catch {
     return res.status(409).json({ error: 'A user with that email already exists.' });
   }
 });
 
+app.patch('/api/auth/users/:id/role', requireSuperAdmin, (req: AuthenticatedRequest, res) => {
+  const { id } = req.params;
+  const parsed = UserRoleUpdateSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid role payload.' });
+  }
+
+  const row = db.prepare('SELECT id, email, allowed_tenants FROM users WHERE id = ?').get(id) as
+    | { id: string; email: string; allowed_tenants: string }
+    | undefined;
+  if (!row) {
+    return res.status(404).json({ error: 'User not found.' });
+  }
+
+  const nextTenants =
+    parsed.data.role === 'super_admin'
+      ? ['*']
+      : parsed.data.role === 'caller'
+      ? []
+      : parsed.data.allowedTenants && parsed.data.allowedTenants.length > 0
+      ? parsed.data.allowedTenants
+      : JSON.parse(row.allowed_tenants);
+
+  db.prepare('UPDATE users SET role = ?, allowed_tenants = ? WHERE id = ?').run(
+    parsed.data.role,
+    JSON.stringify(nextTenants),
+    id
+  );
+  writeAuditLog({
+    req,
+    action: 'auth.user_role_updated',
+    targetId: id,
+    metadata: { role: parsed.data.role, allowedTenants: nextTenants },
+  });
+
+  return res.json({
+    success: true,
+    user: { id: row.id, email: row.email, role: parsed.data.role, allowedTenants: nextTenants },
+  });
+});
+
+app.post('/api/auth/users/:id/revoke', requireSuperAdmin, (req: AuthenticatedRequest, res) => {
+  const { id } = req.params;
+  if (id === req.authUser?.sub) {
+    return res.status(400).json({ error: 'Administrators cannot revoke their own active session.' });
+  }
+  const parsed = UserRevokeUpdateSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'revoked boolean is required.' });
+  }
+
+  const row = db.prepare('SELECT id, email FROM users WHERE id = ?').get(id) as
+    | { id: string; email: string }
+    | undefined;
+  if (!row) {
+    return res.status(404).json({ error: 'User not found.' });
+  }
+
+  db.prepare('UPDATE users SET revoked = ? WHERE id = ?').run(parsed.data.revoked ? 1 : 0, id);
+  writeAuditLog({
+    req,
+    action: parsed.data.revoked ? 'auth.user_revoked' : 'auth.user_restored',
+    targetId: id,
+    metadata: { revoked: parsed.data.revoked },
+  });
+
+  return res.json({ success: true, id: row.id, revoked: parsed.data.revoked });
+});
+
 // -------------------------------------------------------------
 // 6. Multi-Tenant Endpoints (Public Summaries vs Scoped Admin)
 // -------------------------------------------------------------
-app.get('/api/tenants', (req, res) => {
-  const user = getAuthUser(req);
+app.get('/api/tenants', async (req, res) => {
+  const user = await resolveAuthUser(req);
   const rows = db.prepare('SELECT data FROM tenants').all() as { data: string }[];
   const allTenants = rows.map(r => JSON.parse(r.data) as TenantConfig);
 
   if (user && (user.role === 'super_admin' || user.role === 'tenant_admin')) {
-    const scoped = allTenants.filter(t => canAccessTenant(user, t.id));
+    const scoped = allTenants.filter(t => canAccessTenant(user, t.id)).map(toSafeAdminTenant);
     return res.json(scoped);
   }
 
@@ -1110,7 +1497,7 @@ app.get('/api/tenants/:id', requireAdmin, (req: AuthenticatedRequest, res) => {
   if (!tenant) {
     return res.status(404).json({ error: 'Tenant not found.' });
   }
-  return res.json(tenant);
+  return res.json(toSafeAdminTenant(tenant));
 });
 
 app.post('/api/tenants', requireSuperAdmin, (req: AuthenticatedRequest, res) => {
@@ -1119,6 +1506,12 @@ app.post('/api/tenants', requireSuperAdmin, (req: AuthenticatedRequest, res) => 
     return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid tenant payload' });
   }
   const newTenant = parsed.data as TenantConfig;
+  if (newTenant.webhookConfig?.enabled && newTenant.webhookConfig?.url) {
+    const check = validateOutboundWebhookUrl(newTenant.webhookConfig.url, ALLOW_LOCAL_WEBHOOKS);
+    if (!check.valid) {
+      return res.status(400).json({ error: check.reason || 'Invalid webhook URL.' });
+    }
+  }
   if (getTenantByIdStrict(newTenant.id)) {
     return res.status(409).json({ error: 'Tenant ID already exists.' });
   }
@@ -1133,7 +1526,7 @@ app.post('/api/tenants', requireSuperAdmin, (req: AuthenticatedRequest, res) => 
     tenantId: newTenant.id,
     targetId: newTenant.id,
   });
-  return res.status(201).json({ success: true, tenant: newTenant });
+  return res.status(201).json({ success: true, tenant: toSafeAdminTenant(newTenant) });
 });
 
 app.post('/api/tenants/:id', requireAdmin, (req: AuthenticatedRequest, res) => {
@@ -1151,6 +1544,17 @@ app.post('/api/tenants/:id', requireAdmin, (req: AuthenticatedRequest, res) => {
     return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid tenant payload' });
   }
   const updated = parsed.data as TenantConfig;
+  if (updated.webhookConfig) {
+    if (updated.webhookConfig.enabled && updated.webhookConfig.url) {
+      const check = validateOutboundWebhookUrl(updated.webhookConfig.url, ALLOW_LOCAL_WEBHOOKS);
+      if (!check.valid) {
+        return res.status(400).json({ error: check.reason || 'Invalid webhook URL.' });
+      }
+    }
+    if (!updated.webhookConfig.signingSecret || updated.webhookConfig.signingSecret === '********') {
+      updated.webhookConfig.signingSecret = existing.webhookConfig?.signingSecret;
+    }
+  }
   db.prepare('INSERT OR REPLACE INTO tenants (id, data, updated_at) VALUES (?, ?, ?)').run(
     id,
     JSON.stringify(updated),
@@ -1161,9 +1565,13 @@ app.post('/api/tenants/:id', requireAdmin, (req: AuthenticatedRequest, res) => {
     action: 'tenant.updated',
     tenantId: id,
     targetId: id,
-    metadata: { kbChunks: updated.knowledgeBase.length, toolsCount: updated.tools.length },
+    metadata: {
+      kbChunks: updated.knowledgeBase.length,
+      toolsCount: updated.tools.length,
+      webhookEnabled: Boolean(updated.webhookConfig?.enabled),
+    },
   });
-  return res.json({ success: true, tenant: updated });
+  return res.json({ success: true, tenant: toSafeAdminTenant(updated) });
 });
 
 // -------------------------------------------------------------
@@ -1278,6 +1686,7 @@ app.delete('/api/session/data', requireAuthenticated, (req: AuthenticatedRequest
   const deletedHandoffs = Number(db.prepare('DELETE FROM handoff_tickets WHERE session_id = ?').run(sessionId).changes || 0);
   const deletedSupportTickets = Number(db.prepare('DELETE FROM support_tickets WHERE session_id = ?').run(sessionId).changes || 0);
   const deletedAppointments = Number(db.prepare('DELETE FROM appointments WHERE session_id = ?').run(sessionId).changes || 0);
+  const deletedIntegrations = Number(db.prepare('DELETE FROM integration_deliveries WHERE session_id = ?').run(sessionId).changes || 0);
   db.prepare('DELETE FROM consent_records WHERE session_id = ?').run(sessionId);
   db.prepare('DELETE FROM pending_actions WHERE session_id = ?').run(sessionId);
 
@@ -1285,7 +1694,7 @@ app.delete('/api/session/data', requireAuthenticated, (req: AuthenticatedRequest
     req,
     action: 'session.data_deleted',
     targetId: sessionId,
-    metadata: { deletedLogs, deletedHandoffs, deletedSupportTickets, deletedAppointments },
+    metadata: { deletedLogs, deletedHandoffs, deletedSupportTickets, deletedAppointments, deletedIntegrations },
   });
 
   return res.json({
@@ -1295,9 +1704,10 @@ app.delete('/api/session/data', requireAuthenticated, (req: AuthenticatedRequest
       handoffTickets: deletedHandoffs,
       supportTickets: deletedSupportTickets,
       appointments: deletedAppointments,
+      integrations: deletedIntegrations,
     },
     message:
-      'All transcripts, safety handoff tickets, support tickets, appointments, consent records, and pending confirmations for your active session have been permanently deleted.',
+      'All transcripts, safety handoff tickets, support tickets, appointments, outbound webhook deliveries, consent records, and pending confirmations for your active session have been permanently deleted.',
   });
 });
 
@@ -1322,6 +1732,7 @@ app.post('/api/user/wipe-all', requireSuperAdmin, (req: AuthenticatedRequest, re
     db.exec('DELETE FROM support_tickets');
     db.exec('DELETE FROM handoff_tickets');
     db.exec('DELETE FROM appointments');
+    db.exec('DELETE FROM integration_deliveries');
     db.exec('DELETE FROM pending_actions');
     db.exec('DELETE FROM audit_logs');
     db.exec('DELETE FROM tenants');
@@ -1336,7 +1747,7 @@ app.post('/api/user/wipe-all', requireSuperAdmin, (req: AuthenticatedRequest, re
     return res.json({
       success: true,
       message:
-        'All workspace transcripts, consent logs, handoff queues, appointments, support tickets, and custom tenants have been permanently wiped.',
+        'All workspace transcripts, consent logs, handoff queues, appointments, integration deliveries, support tickets, and custom tenants have been permanently wiped.',
       wipedAt: Date.now(),
     });
   } catch (err) {
@@ -1456,7 +1867,7 @@ app.get('/api/appointments', requireAdmin, (req: AuthenticatedRequest, res) => {
   return res.json(filtered);
 });
 
-app.patch('/api/appointments/:id', requireAdmin, (req: AuthenticatedRequest, res) => {
+app.patch('/api/appointments/:id', requireAdmin, async (req: AuthenticatedRequest, res) => {
   const { id } = req.params;
   const parsed = AppointmentUpdateSchema.safeParse(req.body);
   if (!parsed.success) {
@@ -1480,6 +1891,24 @@ app.patch('/api/appointments/:id', requireAdmin, (req: AuthenticatedRequest, res
     metadata: { status: parsed.data.status },
   });
 
+  const tenant = getTenantByIdStrict(row.tenant_id);
+  let delivery: IntegrationDelivery | null = null;
+  if (tenant && tenant.webhookConfig?.enabled && tenant.webhookConfig?.url) {
+    delivery = await enqueueAndDispatchWebhook({
+      tenant,
+      sessionId: row.session_id,
+      eventType: parsed.data.status === 'cancelled' ? 'appointment.cancelled' : 'appointment.updated',
+      idempotencyKey: `apt_${row.id}_${parsed.data.status}_${Date.now()}`,
+      payload: {
+        appointmentId: row.id,
+        doctor: row.doctor,
+        slot: row.slot,
+        patientName: row.patient_name,
+        status: parsed.data.status,
+      },
+    });
+  }
+
   return res.json({
     success: true,
     appointment: {
@@ -1490,7 +1919,211 @@ app.patch('/api/appointments/:id', requireAdmin, (req: AuthenticatedRequest, res
       patientName: row.patient_name,
       status: parsed.data.status,
     },
+    integrationDelivery: delivery,
   });
+});
+
+app.get('/api/appointments/:id/calendar.ics', requireAuthenticated, (req: AuthenticatedRequest, res) => {
+  const { id } = req.params;
+  const row = db.prepare('SELECT * FROM appointments WHERE id = ?').get(id) as any | undefined;
+  if (!row) {
+    return res.status(404).json({ error: 'Appointment not found.' });
+  }
+  const user = req.authUser!;
+  const isOwnerSession = row.session_id === user.sessionId;
+  if (!isOwnerSession && !canAccessTenant(user, row.tenant_id)) {
+    return res.status(403).json({ error: 'Forbidden: cannot export calendar invite for another session.' });
+  }
+  const tenant = getTenantByIdStrict(row.tenant_id);
+  if (!tenant) {
+    return res.status(404).json({ error: 'Tenant not found.' });
+  }
+
+  const icsContent = buildCalendarIcs(
+    {
+      id: row.id,
+      tenantId: row.tenant_id,
+      sessionId: row.session_id,
+      doctor: row.doctor,
+      slot: row.slot,
+      patientName: row.patient_name,
+      status: row.status,
+      actionId: row.action_id,
+      createdAt: row.created_at,
+      expiresAt: row.expires_at ?? null,
+    },
+    tenant
+  );
+
+  res.setHeader('Content-Type', 'text/calendar; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="appointment-${row.id}.ics"`);
+  return res.send(icsContent);
+});
+
+app.get('/api/integrations', requireAdmin, (req: AuthenticatedRequest, res) => {
+  const user = req.authUser!;
+  const tenantFilter = typeof req.query.tenantId === 'string' ? req.query.tenantId.trim() : undefined;
+
+  if (tenantFilter && !canAccessTenant(user, tenantFilter)) {
+    return res.status(403).json({ error: 'Forbidden: cannot read integrations for requested tenant.' });
+  }
+
+  const rows = tenantFilter
+    ? (db.prepare('SELECT * FROM integration_deliveries WHERE tenant_id = ? ORDER BY created_at DESC LIMIT 100').all(tenantFilter) as any[])
+    : (db.prepare('SELECT * FROM integration_deliveries ORDER BY created_at DESC LIMIT 100').all() as any[]);
+
+  const filtered: IntegrationDelivery[] = rows
+    .filter(r => canAccessTenant(user, r.tenant_id))
+    .map(r => ({
+      id: r.id,
+      tenantId: r.tenant_id,
+      sessionId: r.session_id || null,
+      eventType: r.event_type,
+      targetUrl: r.target_url,
+      status: r.status,
+      attemptCount: r.attempt_count,
+      lastStatusCode: r.last_status_code ?? null,
+      lastError: r.last_error ?? null,
+      latencyMs: r.latency_ms ?? null,
+      idempotencyKey: r.idempotency_key,
+      createdAt: r.created_at,
+      updatedAt: r.updated_at,
+    }));
+
+  return res.json(filtered);
+});
+
+app.post('/api/integrations/:id/retry', requireAdmin, async (req: AuthenticatedRequest, res) => {
+  const { id } = req.params;
+  const row = db.prepare('SELECT * FROM integration_deliveries WHERE id = ?').get(id) as any | undefined;
+  if (!row) {
+    return res.status(404).json({ error: 'Integration delivery record not found.' });
+  }
+  if (!canAccessTenant(req.authUser, row.tenant_id)) {
+    return res.status(403).json({ error: 'Forbidden: cannot retry integration for another tenant.' });
+  }
+  const tenant = getTenantByIdStrict(row.tenant_id);
+  if (!tenant || !tenant.webhookConfig?.enabled || !tenant.webhookConfig?.url) {
+    return res.status(400).json({ error: 'Outbound webhook is not configured or enabled for this tenant.' });
+  }
+
+  const secret = tenant.webhookConfig.signingSecret || WEBHOOK_SIGNING_SECRET || SESSION_SECRET;
+  const outcome = await dispatchWebhookWithRetry({
+    targetUrl: tenant.webhookConfig.url,
+    signingSecret: secret,
+    secretHeaderName: tenant.webhookConfig.secretHeaderName,
+    payloadJson: row.payload_json,
+    idempotencyKey: row.idempotency_key,
+    allowLocal: ALLOW_LOCAL_WEBHOOKS,
+    maxAttempts: 2,
+    backoffMs: [0, 150],
+    timeoutMs: 2500,
+  });
+
+  const nextAttempts = Number(row.attempt_count || 0) + outcome.attemptCount;
+  const now = Date.now();
+  db.prepare(
+    'UPDATE integration_deliveries SET target_url = ?, status = ?, attempt_count = ?, last_status_code = ?, last_error = ?, latency_ms = ?, updated_at = ? WHERE id = ?'
+  ).run(
+    tenant.webhookConfig.url,
+    outcome.status,
+    nextAttempts,
+    outcome.lastStatusCode,
+    outcome.lastError,
+    outcome.latencyMs,
+    now,
+    id
+  );
+
+  writeAuditLog({
+    req,
+    action: 'integration.retried',
+    tenantId: row.tenant_id,
+    targetId: id,
+    metadata: { status: outcome.status, statusCode: outcome.lastStatusCode },
+  });
+
+  return res.json({
+    success: outcome.status === 'delivered',
+    delivery: {
+      id: row.id,
+      tenantId: row.tenant_id,
+      sessionId: row.session_id || null,
+      eventType: row.event_type,
+      targetUrl: tenant.webhookConfig.url,
+      status: outcome.status,
+      attemptCount: nextAttempts,
+      lastStatusCode: outcome.lastStatusCode,
+      lastError: outcome.lastError,
+      latencyMs: outcome.latencyMs,
+      idempotencyKey: row.idempotency_key,
+      createdAt: row.created_at,
+      updatedAt: now,
+    },
+  });
+});
+
+app.get('/api/metrics/operational', requireAdmin, (req: AuthenticatedRequest, res) => {
+  const user = req.authUser!;
+  const logRows = (db.prepare('SELECT tenant_id, data FROM call_logs').all() as { tenant_id: string; data: string }[])
+    .filter(r => canAccessTenant(user, r.tenant_id))
+    .map(r => JSON.parse(r.data) as CallLog);
+  const handoffRows = (db.prepare('SELECT * FROM handoff_tickets').all() as any[])
+    .filter(r => canAccessTenant(user, r.tenant_id))
+    .map(r => ({
+      id: r.id,
+      tenantId: r.tenant_id,
+      tenantName: r.tenant_name,
+      sessionId: r.session_id,
+      reason: r.reason,
+      priority: r.priority,
+      summary: r.summary,
+      department: r.department,
+      phone: r.phone,
+      status: r.status,
+      createdAt: r.created_at,
+      updatedAt: r.updated_at,
+    })) as HandoffTicket[];
+  const aptRows = (db.prepare('SELECT * FROM appointments').all() as any[])
+    .filter(r => canAccessTenant(user, r.tenant_id))
+    .map(r => ({
+      id: r.id,
+      tenantId: r.tenant_id,
+      sessionId: r.session_id,
+      doctor: r.doctor,
+      slot: r.slot,
+      patientName: r.patient_name,
+      status: r.status,
+      actionId: r.action_id,
+      createdAt: r.created_at,
+      expiresAt: r.expires_at ?? null,
+    }));
+  const intRows = (db.prepare('SELECT * FROM integration_deliveries').all() as any[])
+    .filter(r => canAccessTenant(user, r.tenant_id))
+    .map(r => ({
+      id: r.id,
+      tenantId: r.tenant_id,
+      sessionId: r.session_id,
+      eventType: r.event_type,
+      targetUrl: r.target_url,
+      status: r.status,
+      attemptCount: r.attempt_count,
+      lastStatusCode: r.last_status_code ?? null,
+      lastError: r.last_error ?? null,
+      latencyMs: r.latency_ms ?? null,
+      idempotencyKey: r.idempotency_key,
+      createdAt: r.created_at,
+      updatedAt: r.updated_at,
+    })) as IntegrationDelivery[];
+
+  return res.json(
+    computeOperationalMetrics({
+      logs: logRows,
+      handoffs: handoffRows,
+      appointments: aptRows,
+      integrations: intRows,
+    })
+  );
 });
 
 app.get('/api/audit-logs', requireAdmin, (req: AuthenticatedRequest, res) => {
@@ -1573,13 +2206,13 @@ app.get('/api/health', (_req, res) => {
   }
 });
 
-app.post('/api/support/ticket', (req: AuthenticatedRequest, res) => {
+app.post('/api/support/ticket', async (req: AuthenticatedRequest, res) => {
   const parsed = SupportTicketSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid support ticket payload.' });
   }
 
-  const user = getAuthUser(req);
+  const user = await resolveAuthUser(req);
   const { name, email, subject, message, tenantId } = parsed.data;
   const ticketId = `VANI-${crypto.randomInt(100000, 999999)}`;
   const now = Date.now();
@@ -1679,6 +2312,20 @@ app.post('/api/turn', requireAuthenticated, turnLimiter, async (req: Authenticat
       targetId: ticket.id,
       metadata: { priority: 'critical' },
     });
+    if (tenant.webhookConfig?.enabled && tenant.webhookConfig?.url) {
+      await enqueueAndDispatchWebhook({
+        tenant,
+        sessionId,
+        eventType: 'handoff.created',
+        idempotencyKey: `hnd_${ticket.id}`,
+        payload: {
+          ticketId: ticket.id,
+          priority: ticket.priority,
+          reason: ticket.reason,
+          department: ticket.department,
+        },
+      });
+    }
     const emergencyWithTicket = checkEmergencyCondition(userText, activeLang, tenant, ticket.id)!;
     const elapsed = Math.max(1, Math.round(performance.now() - startTurn));
 
@@ -1726,6 +2373,20 @@ app.post('/api/turn', requireAuthenticated, turnLimiter, async (req: Authenticat
       targetId: ticket.id,
       metadata: { priority: 'high' },
     });
+    if (tenant.webhookConfig?.enabled && tenant.webhookConfig?.url) {
+      await enqueueAndDispatchWebhook({
+        tenant,
+        sessionId,
+        eventType: 'handoff.created',
+        idempotencyKey: `hnd_${ticket.id}`,
+        payload: {
+          ticketId: ticket.id,
+          priority: ticket.priority,
+          reason: ticket.reason,
+          department: ticket.department,
+        },
+      });
+    }
     const elapsed = Math.max(1, Math.round(performance.now() - startTurn));
 
     return res.json({
@@ -1786,6 +2447,27 @@ app.post('/api/turn', requireAuthenticated, turnLimiter, async (req: Authenticat
         idempotencyKey,
         req,
       });
+      if (
+        demoOut.toolInvokedName === 'book_appointment' &&
+        durableResult.success &&
+        durableResult.data?.bookingRef &&
+        tenant.webhookConfig?.enabled &&
+        tenant.webhookConfig?.url
+      ) {
+        await enqueueAndDispatchWebhook({
+          tenant,
+          sessionId,
+          eventType: 'appointment.booked',
+          idempotencyKey: `apt_${durableResult.data.bookingRef}`,
+          payload: {
+            bookingRef: durableResult.data.bookingRef,
+            doctor: durableResult.data.doctor,
+            slot: durableResult.data.slot,
+            patientName: durableResult.data.patientName,
+            actionId: durableResult.data.actionId,
+          },
+        });
+      }
       reply = durableResult.outputMessage;
       demoToolCalls.push({ name: demoOut.toolInvokedName, result: durableResult });
       finalMemory = extractMemoryUpdatesFromToolCall(
@@ -1969,6 +2651,27 @@ app.post('/api/turn', requireAuthenticated, turnLimiter, async (req: Authenticat
           idempotencyKey,
           req,
         });
+        if (
+          calledName === 'book_appointment' &&
+          toolResult.success &&
+          toolResult.data?.bookingRef &&
+          tenant.webhookConfig?.enabled &&
+          tenant.webhookConfig?.url
+        ) {
+          await enqueueAndDispatchWebhook({
+            tenant,
+            sessionId,
+            eventType: 'appointment.booked',
+            idempotencyKey: `apt_${toolResult.data.bookingRef}`,
+            payload: {
+              bookingRef: toolResult.data.bookingRef,
+              doctor: toolResult.data.doctor,
+              slot: toolResult.data.slot,
+              patientName: toolResult.data.patientName,
+              actionId: toolResult.data.actionId,
+            },
+          });
+        }
         workingMemory = extractMemoryUpdatesFromToolCall(calledName, callArgs, toolResult, workingMemory);
         executedToolCalls.push({ name: calledName, result: toolResult });
         functionResponseParts.push({

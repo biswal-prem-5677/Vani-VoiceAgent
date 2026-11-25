@@ -302,6 +302,140 @@ export const VoiceConfigTab: React.FC<VoiceConfigTabProps> = ({
         </div>
       </div>
 
+      {/* External EHR / Webhook Integration */}
+      <div className="bg-[#0D111A] border border-white/[0.08] rounded-2xl p-6 shadow-2xl space-y-4">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-white/[0.08]">
+          <div className="flex items-center gap-2">
+            <Globe2 className="w-4 h-4 text-sky-400" />
+            <div>
+              <h3 className="text-sm font-bold text-white">
+                External EHR / Webhook Delivery &amp; Calendar Export
+              </h3>
+              <p className="text-[11px] text-slate-400">
+                Dispatch signed HMAC-SHA256 JSON events on confirmed clinic bookings, cancellations, and safety handoffs (with SSRF protection and bounded retries).
+              </p>
+            </div>
+          </div>
+          <label className="flex items-center gap-2 text-xs font-semibold text-slate-200 cursor-pointer shrink-0">
+            <input
+              type="checkbox"
+              checked={Boolean(config.webhookConfig?.enabled)}
+              onChange={e =>
+                setConfig({
+                  ...config,
+                  webhookConfig: {
+                    enabled: e.target.checked,
+                    url: config.webhookConfig?.url || '',
+                    providerType: config.webhookConfig?.providerType || 'clinic_ehr_webhook',
+                    secretHeaderName: config.webhookConfig?.secretHeaderName || 'X-VaniVoice-Signature',
+                    signingSecret: config.webhookConfig?.signingSecret,
+                  },
+                })
+              }
+              className="w-4 h-4 accent-emerald-500 rounded"
+            />
+            <span>Enable Outbound Webhook</span>
+          </label>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
+          <div>
+            <label className="block text-slate-300 font-medium mb-1">Integration Profile</label>
+            <select
+              value={config.webhookConfig?.providerType || 'clinic_ehr_webhook'}
+              onChange={e =>
+                setConfig({
+                  ...config,
+                  webhookConfig: {
+                    enabled: Boolean(config.webhookConfig?.enabled),
+                    url: config.webhookConfig?.url || '',
+                    providerType: e.target.value as 'clinic_ehr_webhook' | 'logistics_webhook' | 'generic_webhook',
+                    secretHeaderName: config.webhookConfig?.secretHeaderName || 'X-VaniVoice-Signature',
+                    signingSecret: config.webhookConfig?.signingSecret,
+                  },
+                })
+              }
+              aria-label="Webhook provider profile"
+              className="w-full bg-black/40 border border-white/[0.1] rounded-xl px-3 py-2 text-white focus:outline-none focus:border-indigo-500"
+            >
+              <option value="clinic_ehr_webhook">Clinic EHR / Appointment Bridge</option>
+              <option value="logistics_webhook">Logistics Dispatch Webhook</option>
+              <option value="generic_webhook">Generic Signed Webhook</option>
+            </select>
+          </div>
+
+          <div className="md:col-span-2">
+            <label className="block text-slate-300 font-medium mb-1">HTTPS Endpoint URL</label>
+            <input
+              type="url"
+              value={config.webhookConfig?.url || ''}
+              onChange={e =>
+                setConfig({
+                  ...config,
+                  webhookConfig: {
+                    enabled: Boolean(config.webhookConfig?.enabled),
+                    url: e.target.value,
+                    providerType: config.webhookConfig?.providerType || 'clinic_ehr_webhook',
+                    secretHeaderName: config.webhookConfig?.secretHeaderName || 'X-VaniVoice-Signature',
+                    signingSecret: config.webhookConfig?.signingSecret,
+                  },
+                })
+              }
+              placeholder="https://ehr.hospital.example/api/vanivoice/events"
+              aria-label="Webhook target URL"
+              className="w-full bg-black/40 border border-white/[0.1] rounded-xl px-3 py-2 text-white font-mono text-xs focus:outline-none focus:border-indigo-500"
+            />
+          </div>
+
+          <div>
+            <label className="block text-slate-300 font-medium mb-1">Signature Header Name</label>
+            <input
+              type="text"
+              value={config.webhookConfig?.secretHeaderName || 'X-VaniVoice-Signature'}
+              onChange={e =>
+                setConfig({
+                  ...config,
+                  webhookConfig: {
+                    enabled: Boolean(config.webhookConfig?.enabled),
+                    url: config.webhookConfig?.url || '',
+                    providerType: config.webhookConfig?.providerType || 'clinic_ehr_webhook',
+                    secretHeaderName: e.target.value,
+                    signingSecret: config.webhookConfig?.signingSecret,
+                  },
+                })
+              }
+              aria-label="Webhook signature header"
+              className="w-full bg-black/40 border border-white/[0.1] rounded-xl px-3 py-2 text-white font-mono text-xs focus:outline-none focus:border-indigo-500"
+            />
+          </div>
+
+          <div className="md:col-span-2">
+            <label className="block text-slate-300 font-medium mb-1">
+              Signing Secret (HMAC-SHA256, stored server-side only)
+            </label>
+            <input
+              type="password"
+              value={config.webhookConfig?.signingSecret || ''}
+              onChange={e =>
+                setConfig({
+                  ...config,
+                  webhookConfig: {
+                    enabled: Boolean(config.webhookConfig?.enabled),
+                    url: config.webhookConfig?.url || '',
+                    providerType: config.webhookConfig?.providerType || 'clinic_ehr_webhook',
+                    secretHeaderName: config.webhookConfig?.secretHeaderName || 'X-VaniVoice-Signature',
+                    signingSecret: e.target.value,
+                  },
+                })
+              }
+              placeholder="Leave blank to use server WEBHOOK_SIGNING_SECRET"
+              aria-label="Webhook signing secret"
+              className="w-full bg-black/40 border border-white/[0.1] rounded-xl px-3 py-2 text-white font-mono text-xs focus:outline-none focus:border-indigo-500"
+            />
+          </div>
+        </div>
+      </div>
+
       {/* Tools Catalog */}
       <div className="bg-[#0D111A] border border-white/[0.08] rounded-2xl p-6 shadow-2xl space-y-4">
         <div className="flex items-center gap-2 pb-3 border-b border-white/[0.08]">

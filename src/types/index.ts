@@ -61,6 +61,13 @@ export interface TenantConfig {
     phone: string;
     email: string;
   };
+  webhookConfig?: {
+    enabled: boolean;
+    url: string;
+    providerType: 'clinic_ehr_webhook' | 'logistics_webhook' | 'generic_webhook';
+    secretHeaderName: string;
+    signingSecret?: string;
+  };
   isPublicSummaryOnly?: boolean;
 }
 
@@ -116,6 +123,7 @@ export interface AuthUser {
   role: 'caller' | 'tenant_admin' | 'super_admin';
   allowedTenants: string[];
   sessionId: string;
+  authProvider?: 'firebase_oidc' | 'workspace_local' | 'caller_session';
 }
 
 export interface CallLog {
@@ -182,5 +190,47 @@ export interface AuditLogEntry {
   tenantId: string | null;
   targetId: string | null;
   metadata: Record<string, unknown>;
+  createdAt: number;
+}
+
+export interface IntegrationDelivery {
+  id: string;
+  tenantId: string;
+  sessionId?: string | null;
+  eventType: string;
+  targetUrl: string;
+  status: 'pending' | 'delivered' | 'failed' | 'not_configured';
+  attemptCount: number;
+  lastStatusCode: number | null;
+  lastError: string | null;
+  latencyMs: number | null;
+  idempotencyKey: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface OperationalMetricsSummary {
+  totalSessions: number;
+  containmentRatePct: number;
+  handoffRatePct: number;
+  bookingCompletionRatePct: number;
+  confirmedAppointments: number;
+  p50LatencyMs: number;
+  p95LatencyMs: number;
+  failedToolCallsCount: number;
+  safetyEscalationsCount: number;
+  webhookSuccessRatePct: number;
+  deliveredCount: number;
+  failedDeliveriesCount: number;
+}
+
+export interface WorkspaceUserRecord {
+  id: string;
+  email: string;
+  name: string;
+  role: 'caller' | 'tenant_admin' | 'super_admin';
+  allowedTenants: string[];
+  revoked: boolean;
+  authProvider?: string;
   createdAt: number;
 }

@@ -151,19 +151,25 @@ export const Navbar: React.FC<NavbarProps> = ({
               </button>
             </div>
 
-            {authUser && (authUser.role === 'super_admin' || authUser.role === 'tenant_admin') ? (
+            {authUser && (authUser.role === 'super_admin' || authUser.role === 'tenant_admin' || authUser.authProvider === 'firebase_oidc') ? (
               <button
                 onClick={onSignOut}
                 title={`Signed in as ${authUser.email} (${authUser.role}) — click to sign out`}
-                className="px-2.5 py-1.5 rounded-xl bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 hover:bg-emerald-500/25 transition-all cursor-pointer flex items-center gap-1 text-[11px] font-semibold whitespace-nowrap shrink-0"
+                className={`px-2.5 py-1.5 rounded-xl border transition-all cursor-pointer flex items-center gap-1 text-[11px] font-semibold whitespace-nowrap shrink-0 ${
+                  authUser.role === 'super_admin' || authUser.role === 'tenant_admin'
+                    ? 'bg-emerald-500/15 border-emerald-500/30 text-emerald-300 hover:bg-emerald-500/25'
+                    : 'bg-sky-500/15 border-sky-500/30 text-sky-300 hover:bg-sky-500/25'
+                }`}
               >
                 <LogOut className="w-3.5 h-3.5" />
-                <span>Admin</span>
+                <span>
+                  {authUser.role === 'super_admin' || authUser.role === 'tenant_admin' ? 'Admin' : 'Signed In'}
+                </span>
               </button>
             ) : (
               <button
                 onClick={onOpenAuth}
-                title="Admin Sign-In"
+                title="Workspace Sign-In"
                 className="px-2.5 py-1.5 rounded-xl bg-indigo-500/15 border border-indigo-500/30 text-indigo-300 hover:bg-indigo-500/25 transition-all cursor-pointer flex items-center gap-1 text-[11px] font-semibold whitespace-nowrap shrink-0"
               >
                 <LogIn className="w-3.5 h-3.5" />
