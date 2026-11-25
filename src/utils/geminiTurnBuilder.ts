@@ -238,6 +238,9 @@ export function extractMemoryUpdatesFromToolCall(
   if (toolResult.requiresConfirmation) {
     nextMemory.pendingAction = toolName;
     nextMemory.pendingBooking = 'true';
+    if (toolResult.data?.actionId) {
+      nextMemory.pendingActionId = String(toolResult.data.actionId);
+    }
   }
 
   const resData = toolResult.data || {};
@@ -245,12 +248,14 @@ export function extractMemoryUpdatesFromToolCall(
     nextMemory.bookingRef = String(resData.bookingRef);
     delete nextMemory.pendingAction;
     delete nextMemory.pendingBooking;
+    delete nextMemory.pendingActionId;
   }
   if (resData.status) {
     nextMemory.lastToolStatus = String(resData.status);
     if (toolName === 'reschedule_delivery' && resData.status === 'Rescheduled') {
       delete nextMemory.pendingAction;
       delete nextMemory.pendingBooking;
+      delete nextMemory.pendingActionId;
     }
   }
   if (resData.orderId) {

@@ -38,7 +38,9 @@ export const LegalModal: React.FC<LegalModalProps> = ({
       });
       const data = await res.json().catch(() => ({}));
       if (res.ok) {
-        setWipeSuccess('All session transcripts, consent settings, and pending actions for your active session have been permanently deleted.');
+        setWipeSuccess(
+          'All transcripts, safety handoff tickets, support tickets, appointments, consent records, and pending confirmations for your active session have been permanently deleted.'
+        );
         setConfirmingWipe(null);
         onDataWiped?.('session');
       } else {
@@ -158,13 +160,16 @@ export const LegalModal: React.FC<LegalModalProps> = ({
               <div className="p-3 rounded-xl bg-white/[0.03] border border-white/5 space-y-2">
                 <h4 className="font-semibold text-white">2. Consent & Retention Enforcement</h4>
                 <p>
-                  Transcript persistence is strictly gated on explicit consent and a retention window above 0 days. Choosing <strong>Delete on call end (0 days)</strong> or <strong>Ephemeral Only</strong> skips SQLite transcript storage and purges prior logs for your active session. Expired logs are removed automatically by a scheduled retention cleanup job.
+                  Transcript persistence is strictly gated on explicit consent and a retention window above 0 days. Choosing <strong>Delete on call end (0 days)</strong> or <strong>Ephemeral Only</strong> skips SQLite transcript storage and purges prior logs for your active session.
+                </p>
+                <p>
+                  Safety/human-handoff tickets auto-expire after <strong>30 days</strong>, and support desk tickets and confirmed appointments auto-expire after <strong>90 days</strong>. All expired records across every table are removed automatically on startup and every 15 minutes.
                 </p>
               </div>
               <div className="p-3 rounded-xl bg-white/[0.03] border border-white/5 space-y-2">
                 <h4 className="font-semibold text-white">3. Tenant Isolation & Authorization</h4>
                 <p>
-                  Administrative transcript views, handoff queues, knowledge base editing, and workspace wipes require authenticated server-signed tokens scoped to authorized tenant IDs.
+                  Administrative transcript views, handoff queues, clinic appointments, audit logs, knowledge base editing, and workspace wipes require authenticated server-signed tokens scoped to authorized tenant IDs.
                 </p>
               </div>
             </div>
@@ -221,6 +226,18 @@ export const LegalModal: React.FC<LegalModalProps> = ({
                       <td className="p-2 text-slate-400">Auto-expires per retention setting; 0 days = never stored</td>
                     </tr>
                     <tr>
+                      <td className="p-2 font-medium text-white">Safety Handoff Tickets</td>
+                      <td className="p-2 text-indigo-300">Escalation summary</td>
+                      <td className="p-2 text-emerald-400">None</td>
+                      <td className="p-2 text-slate-400">30-day auto-expiry; deleted immediately via Delete My Current Session Data</td>
+                    </tr>
+                    <tr>
+                      <td className="p-2 font-medium text-white">Support & Appointments</td>
+                      <td className="p-2 text-indigo-300">SQLite operational queue</td>
+                      <td className="p-2 text-emerald-400">None</td>
+                      <td className="p-2 text-slate-400">90-day auto-expiry; deleted immediately via Delete My Current Session Data</td>
+                    </tr>
+                    <tr>
                       <td className="p-2 font-medium text-white">Ad IDs / Trackers</td>
                       <td className="p-2 text-slate-500">None</td>
                       <td className="p-2 text-emerald-400">None</td>
@@ -260,7 +277,7 @@ export const LegalModal: React.FC<LegalModalProps> = ({
               <div className="space-y-3 pt-1">
                 {confirmingWipe === 'session' ? (
                   <div className="p-3 rounded-xl bg-rose-950/40 border border-rose-500/40 flex items-center justify-between gap-3">
-                    <span className="text-rose-200">Confirm deleting all logs and consent records for this session?</span>
+                    <span className="text-rose-200">Confirm deleting all transcripts, handoff tickets, support tickets, appointments, and consent records for this session?</span>
                     <div className="flex gap-2 shrink-0">
                       <button
                         onClick={() => setConfirmingWipe(null)}

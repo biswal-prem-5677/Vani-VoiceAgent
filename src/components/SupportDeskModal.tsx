@@ -4,9 +4,16 @@ import { X, Headphones, Send, Mail, CheckCircle2, MessageSquare, AlertCircle } f
 interface SupportDeskModalProps {
   isOpen: boolean;
   onClose: () => void;
+  authToken?: string | null;
+  tenantId?: string;
 }
 
-export const SupportDeskModal: React.FC<SupportDeskModalProps> = ({ isOpen, onClose }) => {
+export const SupportDeskModal: React.FC<SupportDeskModalProps> = ({
+  isOpen,
+  onClose,
+  authToken = null,
+  tenantId,
+}) => {
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
   const [category, setCategory] = useState('Technical Issue / Bug');
@@ -37,12 +44,16 @@ export const SupportDeskModal: React.FC<SupportDeskModalProps> = ({ isOpen, onCl
     try {
       const res = await fetch('/api/support/ticket', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+        },
         body: JSON.stringify({
           name: name.trim(),
           email: email.trim(),
           subject: `[${category}] ${subject.trim() || 'General Support Request'}`,
           message: message.trim(),
+          ...(tenantId ? { tenantId } : {}),
         }),
       });
 
@@ -73,7 +84,8 @@ export const SupportDeskModal: React.FC<SupportDeskModalProps> = ({ isOpen, onCl
           </div>
           <button
             onClick={onClose}
-            className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-white/10 transition"
+            aria-label="Close support modal"
+            className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-white/10 transition cursor-pointer"
           >
             <X className="w-5 h-5" />
           </button>

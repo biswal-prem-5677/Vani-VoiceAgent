@@ -13,27 +13,35 @@ import {
   AlertTriangle,
   Lock,
   BellRing,
+  CalendarCheck,
+  History,
 } from 'lucide-react';
-import { CallLog, HandoffTicket, SupportedLanguage } from '../types';
+import { CallLog, HandoffTicket, SupportedLanguage, AppointmentRecord, AuditLogEntry } from '../types';
 import { calculatePercentiles } from '../utils/latencyTracker';
 
 interface CallLogsTabProps {
   logs: CallLog[];
   handoffs?: HandoffTicket[];
+  appointments?: AppointmentRecord[];
+  auditLogs?: AuditLogEntry[];
   isAdmin?: boolean;
   authToken?: string | null;
   onClearLogs?: () => void;
   onUpdateHandoffStatus?: (id: string, status: HandoffTicket['status']) => Promise<void> | void;
+  onUpdateAppointmentStatus?: (id: string, status: AppointmentRecord['status']) => Promise<void> | void;
   onOpenAuth?: () => void;
 }
 
 export const CallLogsTab: React.FC<CallLogsTabProps> = ({
   logs,
   handoffs = [],
+  appointments = [],
+  auditLogs = [],
   isAdmin = false,
   authToken = null,
   onClearLogs,
   onUpdateHandoffStatus,
+  onUpdateAppointmentStatus,
   onOpenAuth,
 }) => {
   const [selectedCall, setSelectedCall] = useState<CallLog | null>(null);
@@ -43,6 +51,7 @@ export const CallLogsTab: React.FC<CallLogsTabProps> = ({
   const [isDeleting, setIsDeleting] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [updatingHandoffId, setUpdatingHandoffId] = useState<string | null>(null);
+  const [updatingAppointmentId, setUpdatingAppointmentId] = useState<string | null>(null);
 
   // Compute all metrics strictly from actual data in logs
   const allLatencies = logs
@@ -91,6 +100,19 @@ export const CallLogsTab: React.FC<CallLogsTabProps> = ({
       setActionError('Failed to update handoff ticket: ' + String(e));
     } finally {
       setUpdatingHandoffId(null);
+    }
+  };
+
+  const handleAppointmentUpdate = async (id: string, nextStatus: AppointmentRecord['status']) => {
+    if (!onUpdateAppointmentStatus) return;
+    setUpdatingAppointmentId(id);
+    setActionError(null);
+    try {
+      await onUpdateAppointmentStatus(id, nextStatus);
+    } catch (e) {
+      setActionError('Failed to update appointment: ' + String(e));
+    } finally {
+      setUpdatingAppointmentId(null);
     }
   };
 
@@ -300,6 +322,108 @@ export const CallLogsTab: React.FC<CallLogsTabProps> = ({
                         Resolve
                       </button>
                     )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Clinic Appointments Ledger (Admin Only) */}
+      {isAdmin && (
+        <div className="bg-[#0D111A] border border-white/[0.08] rounded-2xl p-5 shadow-2xl space-y-4">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <CalendarCheck className="w-4 h-4 text-emerald-400" />
+              <h3 className="text-sm font-bold text-white tracking-tight">
+                Clinic Appointments Ledger ({appointments.length})
+              </h3>
+            </div>
+            <span className="text-[11px] text-slate-400 font-mono">
+              {appointments.filter(a => a.status === 'confirmed').length} active slots
+            </span>
+          </div>
+
+          {appointments.length === 0 ? (
+            <p className="text-xs text-slate-400 py-2">
+              No persistent appointments have been booked yet.
+            </p>
+          ) : (
+            <div className="space-y-2.5">
+              {appointments.map(apt => (
+                <div
+                  key={apt.id}
+                  className="p-3.5 rounded-xl bg-black/40 border border-white/[0.08] flex flex-col md:flex-row md:items-center justify-between gap-3 text-xs"
+                >
+                  <div className="space-y-1">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="font-mono font-bold text-white">{apt.id}</span>
+                      <span
+                        className={`px-2 py-0.5 rounded font-mono text-[10px] uppercase ${
+                          apt.status === 'confirmed'
+                            ? 'bg-emerald-950/50 text-emerald-300 border border-emerald-500/30'
+                            : 'bg-slate-800 text-slate-400 border border-slate-700'
+                        }`}
+                      >
+                        {apt.status}
+                      </span>
+                      <span className="text-slate-200 font-semibold">{apt.doctor}</span>
+                    </div>
+                    <p className="text-slate-300">
+                      Patient: <strong className="text-white">{apt.patientName}</strong> • Slot:{' '}
+                      <span className="font-mono text-indigo-300">{apt.slot}</span>
+                    </p>
+                    <p className="text-[11px] text-slate-500 font-mono">
+                      Action ID: {apt.actionId} • Tenant: {apt.tenantId}
+                    </p>
+                  </div>
+
+                  {apt.status === 'confirmed' && (
+                    <button
+                      onClick={() => handleAppointmentUpdate(apt.id, 'cancelled')}
+                      disabled={updatingAppointmentId === apt.id}
+                      className="px-3 py-1.5 rounded-lg bg-rose-950/60 hover:bg-rose-900/80 border border-rose-500/40 disabled:opacity-50 text-rose-200 font-semibold cursor-pointer shrink-0"
+                    >
+                      {updatingAppointmentId === apt.id ? 'Updating...' : 'Cancel Slot'}
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Operational Audit Trail (Admin Only) */}
+      {isAdmin && (
+        <div className="bg-[#0D111A] border border-white/[0.08] rounded-2xl p-5 shadow-2xl space-y-3">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <History className="w-4 h-4 text-sky-400" />
+              <h3 className="text-sm font-bold text-white tracking-tight">
+                Operational Audit Trail ({auditLogs.length})
+              </h3>
+            </div>
+            <span className="text-[11px] text-slate-400 font-mono">Trace-correlated SQLite events</span>
+          </div>
+
+          {auditLogs.length === 0 ? (
+            <p className="text-xs text-slate-400 py-2">No audit events recorded yet.</p>
+          ) : (
+            <div className="max-h-56 overflow-y-auto space-y-1.5 pr-1">
+              {auditLogs.slice(0, 25).map(entry => (
+                <div
+                  key={entry.id}
+                  className="px-3 py-2 rounded-lg bg-black/40 border border-white/[0.06] flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-[11px] font-mono"
+                >
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="text-sky-300 font-semibold">{entry.action}</span>
+                    {entry.targetId && <span className="text-slate-300">target={entry.targetId}</span>}
+                    {entry.tenantId && <span className="text-indigo-300">tenant={entry.tenantId}</span>}
+                  </div>
+                  <div className="text-slate-500">
+                    actor={entry.actorRole} • trace={entry.traceId.slice(0, 8)}
                   </div>
                 </div>
               ))}

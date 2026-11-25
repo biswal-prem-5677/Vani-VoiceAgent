@@ -21,7 +21,7 @@ import { SystemStatusModal } from './components/SystemStatusModal';
 import { ShareModal } from './components/ShareModal';
 import { AdminAuthPanel } from './components/AdminAuthPanel';
 import { INITIAL_TENANTS } from './data/tenants';
-import { TenantConfig, DocumentChunk, CallLog, AuthUser, HandoffTicket } from './types';
+import { TenantConfig, DocumentChunk, CallLog, AuthUser, HandoffTicket, AppointmentRecord, AuditLogEntry } from './types';
 import {
   Globe2,
   ShieldCheck,
@@ -38,18 +38,24 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<ActiveTab>('call');
   const [callLogs, setCallLogs] = useState<CallLog[]>([]);
   const [handoffs, setHandoffs] = useState<HandoffTicket[]>([]);
+  const [appointments, setAppointments] = useState<AppointmentRecord[]>([]);
+  const [auditLogs, setAuditLogs] = useState<AuditLogEntry[]>([]);
 
   // In-memory auth session state (tokens are never written to localStorage/sessionStorage)
   const [authToken, setAuthToken] = useState<string | null>(null);
   const [authUser, setAuthUser] = useState<AuthUser | null>(null);
   const [sessionMeta, setSessionMeta] = useState<{
+    loaded: boolean;
     adminBootstrapNeeded: boolean;
+    bootstrapRequiresToken: boolean;
     passcodeConfigured: boolean;
-    serverAiActive: boolean;
+    serverAiActive: boolean | null;
   }>({
+    loaded: false,
     adminBootstrapNeeded: false,
+    bootstrapRequiresToken: false,
     passcodeConfigured: false,
-    serverAiActive: false,
+    serverAiActive: null,
   });
 
   const [consentChoice, setConsentChoice] = useState<ConsentChoice>({
@@ -103,9 +109,12 @@ export default function App() {
   const loadAdminWorkspaceData = useCallback(async (token: string) => {
     await fetchTenantsForToken(token);
     try {
-      const [logsRes, handoffsRes] = await Promise.all([
-        fetch('/api/logs', { headers: { Authorization: `Bearer ${token}` } }),
-        fetch('/api/handoffs', { headers: { Authorization: `Bearer ${token}` } }),
+      const headers = { Authorization: `Bearer ${token}` };
+      const [logsRes, handoffsRes, apptsRes, auditRes] = await Promise.all([
+        fetch('/api/logs', { headers }),
+        fetch('/api/handoffs', { headers }),
+        fetch('/api/appointments', { headers }),
+        fetch('/api/audit-logs', { headers }),
       ]);
       if (logsRes.ok) {
         const logsData = await logsRes.json();
@@ -114,6 +123,14 @@ export default function App() {
       if (handoffsRes.ok) {
         const handoffsData = await handoffsRes.json();
         if (Array.isArray(handoffsData)) setHandoffs(handoffsData);
+      }
+      if (apptsRes.ok) {
+        const apptsData = await apptsRes.json();
+        if (Array.isArray(apptsData)) setAppointments(apptsData);
+      }
+      if (auditRes.ok) {
+        const auditData = await auditRes.json();
+        if (Array.isArray(auditData)) setAuditLogs(auditData);
       }
     } catch {
       // ignore
@@ -146,13 +163,19 @@ export default function App() {
       .then(data => {
         if (data) {
           setSessionMeta({
+            loaded: true,
             adminBootstrapNeeded: Boolean(data.adminBootstrapNeeded),
+            bootstrapRequiresToken: Boolean(data.bootstrapRequiresToken),
             passcodeConfigured: Boolean(data.passcodeConfigured),
             serverAiActive: Boolean(data.serverAiActive),
           });
+        } else {
+          setSessionMeta(prev => ({ ...prev, loaded: true, serverAiActive: false }));
         }
       })
-      .catch(() => {});
+      .catch(() => {
+        setSessionMeta(prev => ({ ...prev, loaded: true, serverAiActive: false }));
+      });
 
     bootstrapCallerSession();
   }, [bootstrapCallerSession]);
@@ -168,6 +191,8 @@ export default function App() {
 
   const handleSignOut = async () => {
     setHandoffs([]);
+    setAppointments([]);
+    setAuditLogs([]);
     setCallLogs([]);
     setAdminErrorBanner(null);
     setAuthToken(null);
@@ -282,6 +307,9 @@ export default function App() {
     if (persisted) {
       setCallLogs(prev => [newLog, ...prev]);
     }
+    if (isAdmin && authToken) {
+      loadAdminWorkspaceData(authToken);
+    }
   };
 
   const handleHandoffCreated = (ticket: HandoffTicket) => {
@@ -310,6 +338,26 @@ export default function App() {
     setHandoffs(prev =>
       prev.map(h => (h.id === id ? { ...h, status, updatedAt: Date.now() } : h))
     );
+  };
+
+  const handleUpdateAppointmentStatus = async (
+    id: string,
+    status: AppointmentRecord['status']
+  ) => {
+    if (!authToken) return;
+    const res = await fetch(`/api/appointments/${id}`, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${authToken}`,
+      },
+      body: JSON.stringify({ status }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data.error || `Failed to update appointment (${res.status})`);
+    }
+    setAppointments(prev => prev.map(a => (a.id === id ? { ...a, status } : a)));
   };
 
   const handleClearLogs = () => {
@@ -418,6 +466,7 @@ export default function App() {
               <div className="py-8">
                 <AdminAuthPanel
                   adminBootstrapNeeded={sessionMeta.adminBootstrapNeeded}
+                  bootstrapRequiresToken={sessionMeta.bootstrapRequiresToken}
                   passcodeConfigured={sessionMeta.passcodeConfigured}
                   onAuthenticated={handleAdminAuthenticated}
                   title="Sign In to Manage Knowledge Base"
@@ -438,6 +487,7 @@ export default function App() {
               <div className="py-8">
                 <AdminAuthPanel
                   adminBootstrapNeeded={sessionMeta.adminBootstrapNeeded}
+                  bootstrapRequiresToken={sessionMeta.bootstrapRequiresToken}
                   passcodeConfigured={sessionMeta.passcodeConfigured}
                   onAuthenticated={handleAdminAuthenticated}
                   title="Sign In to Configure Voice & Tools"
@@ -451,10 +501,13 @@ export default function App() {
             <CallLogsTab
               logs={callLogs}
               handoffs={handoffs}
+              appointments={appointments}
+              auditLogs={auditLogs}
               isAdmin={isAdmin}
               authToken={authToken}
               onClearLogs={handleClearLogs}
               onUpdateHandoffStatus={handleUpdateHandoffStatus}
+              onUpdateAppointmentStatus={handleUpdateAppointmentStatus}
               onOpenAuth={() => setIsAuthModalOpen(true)}
             />
           )}
@@ -529,6 +582,7 @@ export default function App() {
           >
             <AdminAuthPanel
               adminBootstrapNeeded={sessionMeta.adminBootstrapNeeded}
+              bootstrapRequiresToken={sessionMeta.bootstrapRequiresToken}
               passcodeConfigured={sessionMeta.passcodeConfigured}
               onAuthenticated={handleAdminAuthenticated}
               onClose={() => setIsAuthModalOpen(false)}
@@ -551,6 +605,8 @@ export default function App() {
             setCallLogs([]);
             if (scope === 'workspace' && authToken) {
               setHandoffs([]);
+              setAppointments([]);
+              setAuditLogs([]);
               loadAdminWorkspaceData(authToken);
             }
           }}
@@ -559,6 +615,8 @@ export default function App() {
         <SupportDeskModal
           isOpen={isSupportModalOpen}
           onClose={() => setIsSupportModalOpen(false)}
+          authToken={authToken}
+          tenantId={activeTenant.id}
         />
 
         <SystemStatusModal

@@ -4,6 +4,7 @@ import type { AuthUser } from '../types';
 
 interface AdminAuthPanelProps {
   adminBootstrapNeeded: boolean;
+  bootstrapRequiresToken?: boolean;
   passcodeConfigured: boolean;
   onAuthenticated: (token: string, user: AuthUser) => void;
   title?: string;
@@ -13,6 +14,7 @@ interface AdminAuthPanelProps {
 
 export const AdminAuthPanel: React.FC<AdminAuthPanelProps> = ({
   adminBootstrapNeeded,
+  bootstrapRequiresToken = false,
   passcodeConfigured,
   onAuthenticated,
   title = 'Workspace Administrator Access',
@@ -22,6 +24,7 @@ export const AdminAuthPanel: React.FC<AdminAuthPanelProps> = ({
   const [name, setName] = useState('Workspace Admin');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [bootstrapToken, setBootstrapToken] = useState('');
   const [loading, setLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
@@ -33,7 +36,12 @@ export const AdminAuthPanel: React.FC<AdminAuthPanelProps> = ({
     try {
       const endpoint = adminBootstrapNeeded ? '/api/auth/bootstrap' : '/api/auth/login';
       const body = adminBootstrapNeeded
-        ? { name: name.trim(), email: email.trim(), password }
+        ? {
+            name: name.trim(),
+            email: email.trim(),
+            password,
+            ...(bootstrapToken.trim() ? { bootstrapToken: bootstrapToken.trim() } : {}),
+          }
         : { email: email.trim() || undefined, password };
 
       const res = await fetch(endpoint, {
@@ -144,6 +152,23 @@ export const AdminAuthPanel: React.FC<AdminAuthPanelProps> = ({
             />
           </div>
         </div>
+
+        {adminBootstrapNeeded && bootstrapRequiresToken && (
+          <div>
+            <label htmlFor="admin-bootstrap-token" className="block text-slate-300 font-medium mb-1">
+              Administrator Setup Token (ADMIN_BOOTSTRAP_TOKEN)
+            </label>
+            <input
+              id="admin-bootstrap-token"
+              type="password"
+              required
+              value={bootstrapToken}
+              onChange={e => setBootstrapToken(e.target.value)}
+              placeholder="Enter deployment bootstrap token"
+              className="w-full bg-black/40 border border-white/[0.1] rounded-xl px-3 py-2 text-white focus:outline-none focus:border-indigo-500"
+            />
+          </div>
+        )}
 
         <button
           type="submit"

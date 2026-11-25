@@ -17,11 +17,17 @@ const KNOWN_SHIPMENTS: Record<string, { status: string; courier: string; eta: st
   'ORD-10024': { status: 'Delivered', courier: 'Delhivery', eta: 'Yesterday at 3:15 PM', destination: 'Rourkela' },
 };
 
+export interface ToolExecutionOptions {
+  availableSlots?: string[];
+  bookingRef?: string;
+}
+
 export function executeTenantTool(
   toolName: string,
   parameters: Record<string, any>,
   tenantName: string,
-  lang: SupportedLanguage = 'en'
+  lang: SupportedLanguage = 'en',
+  options?: ToolExecutionOptions
 ): ToolExecutionResult {
   switch (toolName) {
     case 'book_appointment': {
@@ -71,7 +77,7 @@ export function executeTenantTool(
       }
 
       // Proceed with confirmed booking
-      const bookingRef = `KAL-APT-${Math.floor(1000 + Math.random() * 9000)}`;
+      const bookingRef = options?.bookingRef || `KAL-APT-${Math.floor(1000 + Math.random() * 9000)}`;
       const successMsg = lang === 'or'
         ? `ଆପଣଙ୍କର ${parameters.doctor}ଙ୍କ ସହିତ ${parameters.slot}ରେ ଆପଏଣ୍ଟମେଣ୍ଟ ସଫଳତାର ସହିତ ବୁକ୍ ହୋଇଗଲା। ଆପଣଙ୍କ ବୁକିଂ ରେଫରେନ୍ସ ନମ୍ବର: ${bookingRef}।`
         : lang === 'hi'
@@ -94,8 +100,24 @@ export function executeTenantTool(
 
     case 'check_slot_availability': {
       const doctor = parameters.doctor?.trim();
-      const slots = ['10:00 AM', '11:30 AM', '04:00 PM', '05:30 PM'];
+      const slots = options?.availableSlots ?? ['10:00 AM', '11:30 AM', '04:00 PM', '05:30 PM'];
       const targetDoc = doctor || 'General OPD';
+
+      if (slots.length === 0) {
+        const emptyMsg = lang === 'or'
+          ? `${targetDoc}ଙ୍କ ପାଇଁ ଆଜି ଆଉ କୌଣସି ଖାଲି ସ୍ଲଟ ନାହିଁ। ଦୟାକରି ଆସନ୍ତାକାଲି ପାଇଁ ଚେଷ୍ଟା କରନ୍ତୁ।`
+          : lang === 'hi'
+          ? `${targetDoc} के लिए आज कोई स्लॉट खाली नहीं है। कृपया अगले दिन का समय जांचें।`
+          : `${targetDoc} has no remaining open slots today. Please ask for tomorrow or another doctor.`;
+
+        return {
+          success: true,
+          toolName,
+          outputMessage: emptyMsg,
+          data: { doctor: targetDoc, availableSlots: [] },
+        };
+      }
+
       const msg = lang === 'or'
         ? `${targetDoc}ଙ୍କ ପାଇଁ ଆଜି ଉପଲବ୍ଧ ସ୍ଲଟ: ${slots.join(', ')}।`
         : lang === 'hi'

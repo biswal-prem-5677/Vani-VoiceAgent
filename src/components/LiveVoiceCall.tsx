@@ -38,7 +38,7 @@ interface LiveVoiceCallProps {
   tenant: TenantConfig;
   authToken: string | null;
   canPersistLogs: boolean;
-  geminiConfigured: boolean;
+  geminiConfigured: boolean | null;
   onCallEnded?: (callRecord: any, persisted: boolean) => void;
   onHandoffCreated?: (ticket: HandoffTicket) => void;
 }
@@ -75,7 +75,7 @@ export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({
     canEnableDemo?: boolean;
   } | null>(null);
   const [isProcessingTurn, setIsProcessingTurn] = useState<boolean>(false);
-  const [offlineDemoMode, setOfflineDemoMode] = useState<boolean>(!geminiConfigured);
+  const [offlineDemoMode, setOfflineDemoMode] = useState<boolean>(geminiConfigured === false);
   const [queuedHandoffTicket, setQueuedHandoffTicket] = useState<HandoffTicket | null>(null);
 
   // Refs synced immediately with state to eliminate stale closures in SpeechRecognition and async handlers
@@ -112,7 +112,13 @@ export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({
   useEffect(() => { authTokenRef.current = authToken; }, [authToken]);
   useEffect(() => { canPersistLogsRef.current = canPersistLogs; }, [canPersistLogs]);
   useEffect(() => { demoModeRef.current = offlineDemoMode; }, [offlineDemoMode]);
-  useEffect(() => { setOfflineDemoMode(!geminiConfigured); }, [geminiConfigured]);
+  useEffect(() => {
+    if (geminiConfigured === false) {
+      setOfflineDemoMode(true);
+    } else if (geminiConfigured === true) {
+      setOfflineDemoMode(false);
+    }
+  }, [geminiConfigured]);
   useEffect(() => { onCallEndedRef.current = onCallEnded; }, [onCallEnded]);
   useEffect(() => { onHandoffCreatedRef.current = onHandoffCreated; }, [onHandoffCreated]);
   useEffect(() => { turnsRef.current = turns; }, [turns]);
@@ -634,7 +640,12 @@ export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({
         const errMessage =
           payload?.error || `Server returned error status (${res.status}). Please retry.`;
         const err: any = new Error(errMessage);
-        err.canEnableDemo = Boolean(payload?.offlineDemoAvailable || payload?.code === 'GEMINI_NOT_CONFIGURED');
+        err.canEnableDemo = Boolean(
+          payload?.offlineDemoAvailable ||
+            payload?.code === 'GEMINI_NOT_CONFIGURED' ||
+            payload?.code === 'UPSTREAM_AI_ERROR' ||
+            payload?.code === 'RESOURCE_EXHAUSTED'
+        );
         throw err;
       }
 
@@ -795,13 +806,17 @@ export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({
         </div>
       )}
 
-      {/* Explicit Offline Demo Mode Notice when Gemini key is unavailable */}
-      {!geminiConfigured && (
+      {/* Explicit Offline Demo Mode Notice when Gemini key is unavailable or user enabled Demo Mode */}
+      {(geminiConfigured === false || offlineDemoMode) && (
         <div className="bg-indigo-950/30 border border-indigo-500/30 rounded-2xl p-3.5 flex items-center justify-between gap-3">
           <div className="text-xs text-indigo-200 leading-relaxed">
-            <strong>Server GEMINI_API_KEY Not Configured:</strong>{' '}
+            <strong>
+              {geminiConfigured === false
+                ? 'Server GEMINI_API_KEY Not Configured:'
+                : 'Offline Deterministic Demo Mode Active:'}
+            </strong>{' '}
             {offlineDemoMode
-              ? 'Running in Offline Deterministic Demo Mode (safety rules, keyword RAG, and mock tools).'
+              ? 'Running deterministic pipeline (safety rules, keyword RAG, and durable SQLite tools).'
               : 'Live LLM generation is unavailable without an API key.'}
           </div>
           <button

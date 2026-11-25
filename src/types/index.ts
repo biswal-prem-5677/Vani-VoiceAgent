@@ -159,3 +159,28 @@ export interface BenchmarkCase {
   actualReply?: string;
   executionStatus?: 'idle' | 'running' | 'completed' | 'error';
 }
+
+export interface AppointmentRecord {
+  id: string;
+  tenantId: string;
+  sessionId: string;
+  doctor: string;
+  slot: string;
+  patientName: string;
+  status: 'confirmed' | 'cancelled';
+  actionId: string;
+  createdAt: number;
+  expiresAt: number | null;
+}
+
+export interface AuditLogEntry {
+  id: string;
+  traceId: string;
+  actorId: string;
+  actorRole: string;
+  action: string;
+  tenantId: string | null;
+  targetId: string | null;
+  metadata: Record<string, unknown>;
+  createdAt: number;
+}

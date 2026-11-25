@@ -14,7 +14,7 @@ import {
   buildHumanEscalationReply,
 } from './src/utils/safety.ts';
 import { searchKnowledgeBase } from './src/utils/ragEngine.ts';
-import { executeTenantTool } from './src/utils/tools.ts';
+import { executeTenantTool, type ToolExecutionResult } from './src/utils/tools.ts';
 import { detectLanguage } from './src/utils/languageDetector.ts';
 import { extractEntitiesFromInput, processTurn } from './src/utils/callPipeline.ts';
 import {
@@ -34,6 +34,13 @@ import {
   type SessionTokenPayload,
 } from './src/utils/auth.ts';
 import {
+  canonicalizeToolParams,
+  verifyProductionSecurityConfig,
+  computeAvailableSlots,
+  isSlotAlreadyBooked,
+  RETENTION_POLICY_DAYS,
+} from './src/utils/actionConfirmation.ts';
+import {
   TurnRequestSchema,
   ConsentRequestSchema,
   SupportTicketSchema,
@@ -43,19 +50,25 @@ import {
   AuthLoginSchema,
   TenantAdminCreateSchema,
   HandoffUpdateSchema,
+  AppointmentUpdateSchema,
 } from './src/utils/schemas.ts';
-import type { TenantConfig, CallLog, HandoffTicket } from './src/types/index.ts';
+import type { TenantConfig, CallLog, HandoffTicket, SupportedLanguage } from './src/types/index.ts';
 
 const app = express();
 app.set('trust proxy', 1);
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+const isDev = process.argv.includes('--dev') || process.env.NODE_ENV === 'development';
 
-// Runtime signing key (process.env override with ephemeral CSPRNG fallback)
-const SESSION_SECRET = process.env.SESSION_SECRET?.trim() || crypto.randomBytes(32).toString('hex');
+const RAW_SESSION_SECRET = process.env.SESSION_SECRET?.trim() || '';
 const ADMIN_PASSCODE = process.env.ADMIN_PASSCODE?.trim() || '';
+const ADMIN_BOOTSTRAP_TOKEN = process.env.ADMIN_BOOTSTRAP_TOKEN?.trim() || '';
 
-// Security headers (iframe-compatible for preview environments)
-app.use((req: Request, res: Response, next: NextFunction) => {
+// Security headers & X-Trace-Id propagation (iframe-compatible for preview environments)
+app.use((req: Request & { traceId?: string }, res: Response, next: NextFunction) => {
+  const incomingTrace = typeof req.headers['x-trace-id'] === 'string' ? req.headers['x-trace-id'].trim() : '';
+  const traceId = incomingTrace && incomingTrace.length <= 64 ? incomingTrace : crypto.randomUUID();
+  req.traceId = traceId;
+  res.setHeader('X-Trace-Id', traceId);
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
   res.setHeader('Permissions-Policy', 'microphone=(self)');
@@ -170,6 +183,31 @@ db.exec(`
     password_hash TEXT NOT NULL,
     created_at INTEGER NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS appointments (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    doctor TEXT NOT NULL,
+    slot TEXT NOT NULL,
+    patient_name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    action_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER
+  );
+
+  CREATE TABLE IF NOT EXISTS audit_logs (
+    id TEXT PRIMARY KEY,
+    trace_id TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    actor_role TEXT NOT NULL,
+    action TEXT NOT NULL,
+    tenant_id TEXT,
+    target_id TEXT,
+    metadata TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  );
 `);
 
 // Safe additive column migrations for pre-existing local SQLite databases
@@ -183,14 +221,60 @@ function ensureColumn(table: string, column: string, definition: string) {
 ensureColumn('call_logs', 'session_id', 'TEXT');
 ensureColumn('call_logs', 'expires_at', 'INTEGER');
 ensureColumn('support_tickets', 'tenant_id', 'TEXT');
+ensureColumn('support_tickets', 'session_id', 'TEXT');
+ensureColumn('support_tickets', 'expires_at', 'INTEGER');
+ensureColumn('handoff_tickets', 'expires_at', 'INTEGER');
+
+// Backfill retention expiry for any pre-existing safety/support tickets missing expires_at
+db.prepare('UPDATE handoff_tickets SET expires_at = created_at + ? WHERE expires_at IS NULL').run(
+  RETENTION_POLICY_DAYS.safetyTicketDays * 24 * 60 * 60 * 1000
+);
+db.prepare('UPDATE support_tickets SET expires_at = created_at + ? WHERE expires_at IS NULL').run(
+  RETENTION_POLICY_DAYS.supportTicketDays * 24 * 60 * 60 * 1000
+);
 
 db.exec(`
   CREATE INDEX IF NOT EXISTS idx_call_logs_created_at ON call_logs(created_at);
   CREATE INDEX IF NOT EXISTS idx_call_logs_tenant_id ON call_logs(tenant_id);
   CREATE INDEX IF NOT EXISTS idx_call_logs_expires_at ON call_logs(expires_at);
   CREATE INDEX IF NOT EXISTS idx_handoff_tickets_tenant_id ON handoff_tickets(tenant_id);
-  CREATE INDEX IF NOT EXISTS idx_pending_actions_session ON pending_actions(session_id, tenant_id, tool_name);
+  CREATE INDEX IF NOT EXISTS idx_handoff_tickets_session_id ON handoff_tickets(session_id);
+  CREATE INDEX IF NOT EXISTS idx_handoff_tickets_expires_at ON handoff_tickets(expires_at);
+  CREATE INDEX IF NOT EXISTS idx_support_tickets_session_id ON support_tickets(session_id);
+  CREATE INDEX IF NOT EXISTS idx_support_tickets_expires_at ON support_tickets(expires_at);
+  CREATE INDEX IF NOT EXISTS idx_pending_actions_session ON pending_actions(session_id, tenant_id, tool_name, params_hash);
+  CREATE INDEX IF NOT EXISTS idx_pending_actions_idem ON pending_actions(session_id, tenant_id, idempotency_key);
+  CREATE INDEX IF NOT EXISTS idx_appointments_tenant_doc ON appointments(tenant_id, doctor, status);
+  CREATE INDEX IF NOT EXISTS idx_appointments_session_id ON appointments(session_id);
+  CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at);
 `);
+
+function hasSuperAdminAccount(): boolean {
+  const row = db
+    .prepare("SELECT COUNT(*) as cnt FROM users WHERE role = 'super_admin'")
+    .get() as { cnt: number };
+  return row.cnt > 0;
+}
+
+const startupSecurity = verifyProductionSecurityConfig({
+  isDev,
+  sessionSecret: RAW_SESSION_SECRET,
+  adminPasscode: ADMIN_PASSCODE,
+  bootstrapToken: ADMIN_BOOTSTRAP_TOKEN,
+  hasExistingSuperAdmin: hasSuperAdminAccount(),
+});
+
+if (!startupSecurity.ok) {
+  for (const errMsg of startupSecurity.errors) {
+    console.error(errMsg);
+  }
+  process.exit(1);
+}
+for (const warnMsg of startupSecurity.warnings) {
+  console.warn(warnMsg);
+}
+
+const SESSION_SECRET = RAW_SESSION_SECRET || crypto.randomBytes(32).toString('hex');
 
 // Seed default tenants if empty
 const tenantCountRow = db.prepare('SELECT COUNT(*) as cnt FROM tenants').get() as { cnt: number };
@@ -212,21 +296,26 @@ if (logCountRow.cnt === 0) {
   }
 }
 
-// Retention purge worker
-function purgeExpiredCallLogs(): number {
+// Retention purge worker across transcripts, safety handoffs, support tickets, appointments, and stale pending confirmations
+function purgeExpiredRecords(): number {
+  const now = Date.now();
+  const stalePendingCutoff = now - RETENTION_POLICY_DAYS.pendingActionHours * 60 * 60 * 1000;
   try {
-    const info = db
-      .prepare('DELETE FROM call_logs WHERE expires_at IS NOT NULL AND expires_at <= ?')
-      .run(Date.now());
-    return Number(info.changes || 0);
+    let total = 0;
+    total += Number(db.prepare('DELETE FROM call_logs WHERE expires_at IS NOT NULL AND expires_at <= ?').run(now).changes || 0);
+    total += Number(db.prepare('DELETE FROM handoff_tickets WHERE expires_at IS NOT NULL AND expires_at <= ?').run(now).changes || 0);
+    total += Number(db.prepare('DELETE FROM support_tickets WHERE expires_at IS NOT NULL AND expires_at <= ?').run(now).changes || 0);
+    total += Number(db.prepare('DELETE FROM appointments WHERE expires_at IS NOT NULL AND expires_at <= ?').run(now).changes || 0);
+    total += Number(db.prepare("DELETE FROM pending_actions WHERE status = 'pending' AND created_at <= ?").run(stalePendingCutoff).changes || 0);
+    return total;
   } catch {
     return 0;
   }
 }
 
-purgeExpiredCallLogs();
+purgeExpiredRecords();
 setInterval(() => {
-  purgeExpiredCallLogs();
+  purgeExpiredRecords();
 }, 15 * 60 * 1000).unref();
 
 // -------------------------------------------------------------
@@ -306,6 +395,7 @@ if (GEMINI_API_KEY) {
 // -------------------------------------------------------------
 interface AuthenticatedRequest extends Request {
   authUser?: SessionTokenPayload;
+  traceId?: string;
 }
 
 function getAuthUser(req: Request): SessionTokenPayload | null {
@@ -387,11 +477,36 @@ function toPublicTenantSummary(tenant: TenantConfig): TenantConfig {
   };
 }
 
-function hasSuperAdminAccount(): boolean {
-  const row = db
-    .prepare("SELECT COUNT(*) as cnt FROM users WHERE role = 'super_admin'")
-    .get() as { cnt: number };
-  return row.cnt > 0;
+function writeAuditLog(params: {
+  req?: AuthenticatedRequest;
+  actorId?: string;
+  actorRole?: string;
+  action: string;
+  tenantId?: string | null;
+  targetId?: string | null;
+  metadata?: Record<string, unknown>;
+}) {
+  try {
+    const id = `aud_${crypto.randomUUID().slice(0, 12)}`;
+    const traceId = params.req?.traceId || crypto.randomUUID();
+    const actorId = params.actorId || params.req?.authUser?.sub || 'anonymous';
+    const actorRole = params.actorRole || params.req?.authUser?.role || 'public';
+    db.prepare(
+      'INSERT INTO audit_logs (id, trace_id, actor_id, actor_role, action, tenant_id, target_id, metadata, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+    ).run(
+      id,
+      traceId,
+      actorId,
+      actorRole,
+      params.action,
+      params.tenantId || null,
+      params.targetId || null,
+      JSON.stringify(params.metadata || {}),
+      Date.now()
+    );
+  } catch {
+    // non-fatal audit failure
+  }
 }
 
 function createHandoffTicket(params: {
@@ -402,7 +517,8 @@ function createHandoffTicket(params: {
   summary: string;
 }): HandoffTicket {
   const now = Date.now();
-  const id = `HND-${Math.floor(100000 + Math.random() * 900000)}`;
+  const expiresAt = now + RETENTION_POLICY_DAYS.safetyTicketDays * 24 * 60 * 60 * 1000;
+  const id = `HND-${crypto.randomInt(100000, 999999)}`;
   const ticket: HandoffTicket = {
     id,
     tenantId: params.tenant.id,
@@ -420,8 +536,8 @@ function createHandoffTicket(params: {
 
   db.prepare(
     `INSERT INTO handoff_tickets
-      (id, tenant_id, tenant_name, session_id, reason, priority, summary, department, phone, status, notes, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      (id, tenant_id, tenant_name, session_id, reason, priority, summary, department, phone, status, notes, created_at, updated_at, expires_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     ticket.id,
     ticket.tenantId,
@@ -435,21 +551,258 @@ function createHandoffTicket(params: {
     ticket.status,
     null,
     ticket.createdAt,
-    ticket.updatedAt
+    ticket.updatedAt,
+    expiresAt
   );
 
   return ticket;
 }
 
-function stableParamsHash(obj: Record<string, any>): string {
-  const { confirmed: _ignored, ...rest } = obj || {};
-  const sorted = Object.keys(rest)
-    .sort()
-    .reduce<Record<string, any>>((acc, k) => {
-      acc[k] = rest[k];
-      return acc;
-    }, {});
-  return crypto.createHash('sha256').update(JSON.stringify(sorted)).digest('hex').slice(0, 24);
+function getBookedSlotsForDoctor(tenantId: string, doctor?: string): string[] {
+  const cleanDoc = doctor?.trim() || '';
+  if (!cleanDoc) {
+    const rows = db
+      .prepare("SELECT slot FROM appointments WHERE tenant_id = ? AND status = 'confirmed'")
+      .all(tenantId) as { slot: string }[];
+    return rows.map(r => r.slot);
+  }
+  const rows = db
+    .prepare(
+      "SELECT slot FROM appointments WHERE tenant_id = ? AND status = 'confirmed' AND (LOWER(doctor) = LOWER(?) OR LOWER(doctor) LIKE LOWER(?))"
+    )
+    .all(tenantId, cleanDoc, `%${cleanDoc}%`) as { slot: string }[];
+  return rows.map(r => r.slot);
+}
+
+interface PendingActionRow {
+  id: string;
+  session_id: string;
+  tenant_id: string;
+  tool_name: string;
+  params_hash: string;
+  idempotency_key: string | null;
+  status: string;
+  result_json: string | null;
+  created_at: number;
+}
+
+function executeServerToolWithDurability(params: {
+  calledName: string;
+  callArgs: Record<string, any>;
+  tenant: TenantConfig;
+  sessionId: string;
+  activeLang: SupportedLanguage;
+  idempotencyKey?: string;
+  req?: AuthenticatedRequest;
+}): ToolExecutionResult {
+  const { calledName, callArgs, tenant, sessionId, activeLang, idempotencyKey, req } = params;
+
+  if (calledName === 'check_slot_availability') {
+    const booked = getBookedSlotsForDoctor(tenant.id, typeof callArgs.doctor === 'string' ? callArgs.doctor : undefined);
+    const availableSlots = computeAvailableSlots(booked);
+    return executeTenantTool(calledName, callArgs, tenant.name, activeLang, { availableSlots });
+  }
+
+  const requiresConfirmationGate =
+    calledName === 'book_appointment' || calledName === 'reschedule_delivery';
+
+  if (!requiresConfirmationGate) {
+    return executeTenantTool(calledName, callArgs, tenant.name, activeLang);
+  }
+
+  const { paramsHash } = canonicalizeToolParams(calledName, callArgs);
+  const requestedActionId = typeof callArgs.actionId === 'string' ? callArgs.actionId.trim() : '';
+
+  let pendingRow: PendingActionRow | undefined;
+
+  if (requestedActionId) {
+    const byId = db
+      .prepare('SELECT * FROM pending_actions WHERE id = ? AND session_id = ? AND tenant_id = ? AND tool_name = ?')
+      .get(requestedActionId, sessionId, tenant.id, calledName) as PendingActionRow | undefined;
+
+    if (byId) {
+      if (byId.status === 'completed' && byId.params_hash === paramsHash && byId.result_json) {
+        try {
+          return JSON.parse(byId.result_json) as ToolExecutionResult;
+        } catch {
+          // continue below
+        }
+      }
+      if (byId.params_hash === paramsHash) {
+        pendingRow = byId;
+      } else {
+        // Explicit parameter mismatch against the referenced actionId -> force fresh confirmation
+        callArgs.confirmed = false;
+      }
+    }
+  }
+
+  if (!pendingRow) {
+    pendingRow = db
+      .prepare(
+        "SELECT * FROM pending_actions WHERE session_id = ? AND tenant_id = ? AND tool_name = ? AND params_hash = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 1"
+      )
+      .get(sessionId, tenant.id, calledName, paramsHash) as PendingActionRow | undefined;
+  }
+
+  if (callArgs.confirmed && (!pendingRow || pendingRow.status !== 'pending')) {
+    // Check if an identical completed action matches this idempotencyKey
+    if (idempotencyKey) {
+      const completedRow = db
+        .prepare(
+          "SELECT result_json FROM pending_actions WHERE session_id = ? AND tenant_id = ? AND tool_name = ? AND params_hash = ? AND idempotency_key = ? AND status = 'completed' ORDER BY created_at DESC LIMIT 1"
+        )
+        .get(sessionId, tenant.id, calledName, paramsHash, idempotencyKey) as { result_json: string } | undefined;
+      if (completedRow?.result_json) {
+        try {
+          return JSON.parse(completedRow.result_json) as ToolExecutionResult;
+        } catch {
+          // continue
+        }
+      }
+    }
+    // Never commit without an active matching pending confirmation for the exact parameters
+    callArgs.confirmed = false;
+  }
+
+  const generatedBookingRef =
+    calledName === 'book_appointment' && callArgs.confirmed
+      ? `KAL-APT-${crypto.randomInt(1000, 9999)}`
+      : undefined;
+
+  const toolResult = executeTenantTool(calledName, callArgs, tenant.name, activeLang, {
+    bookingRef: generatedBookingRef,
+  });
+
+  if (toolResult.requiresConfirmation) {
+    const actionId = pendingRow?.id || `act_${crypto.randomUUID().slice(0, 12)}`;
+    if (!pendingRow) {
+      db.prepare(
+        'INSERT INTO pending_actions (id, session_id, tenant_id, tool_name, params_hash, idempotency_key, status, result_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+      ).run(actionId, sessionId, tenant.id, calledName, paramsHash, null, 'pending', null, Date.now());
+    }
+    toolResult.data = {
+      ...(toolResult.data || {}),
+      actionId,
+      paramsHash,
+    };
+    return toolResult;
+  }
+
+  if (toolResult.success && callArgs.confirmed && pendingRow) {
+    if (calledName === 'book_appointment') {
+      const doctor = String(callArgs.doctor).trim();
+      const slot = String(callArgs.slot).trim();
+      const patientName = String(callArgs.patientName).trim();
+      const bookedSlots = getBookedSlotsForDoctor(tenant.id, doctor);
+
+      if (isSlotAlreadyBooked(slot, bookedSlots)) {
+        db.prepare("UPDATE pending_actions SET status = 'conflict' WHERE id = ? AND status = 'pending'").run(
+          pendingRow.id
+        );
+        const remaining = computeAvailableSlots(bookedSlots);
+        return {
+          success: false,
+          toolName: calledName,
+          outputMessage:
+            remaining.length > 0
+              ? `Sorry, ${slot} with ${doctor} is already booked. Available open slots: ${remaining.join(', ')}.`
+              : `Sorry, ${slot} with ${doctor} is already booked and no open slots remain today.`,
+          data: {
+            conflict: true,
+            doctor,
+            slot,
+            availableSlots: remaining,
+            actionId: pendingRow.id,
+          },
+        };
+      }
+
+      const claim = db
+        .prepare("UPDATE pending_actions SET status = 'completed', idempotency_key = ? WHERE id = ? AND status = 'pending'")
+        .run(idempotencyKey || null, pendingRow.id);
+
+      if (Number(claim.changes || 0) === 0) {
+        const existing = db
+          .prepare('SELECT result_json FROM pending_actions WHERE id = ?')
+          .get(pendingRow.id) as { result_json: string } | undefined;
+        if (existing?.result_json) {
+          try {
+            return JSON.parse(existing.result_json) as ToolExecutionResult;
+          } catch {
+            // continue
+          }
+        }
+      }
+
+      const bookingRef = String(toolResult.data?.bookingRef || generatedBookingRef || `KAL-APT-${crypto.randomInt(1000, 9999)}`);
+      const now = Date.now();
+      const expiresAt = now + RETENTION_POLICY_DAYS.appointmentDays * 24 * 60 * 60 * 1000;
+
+      db.prepare(
+        'INSERT INTO appointments (id, tenant_id, session_id, doctor, slot, patient_name, status, action_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+      ).run(bookingRef, tenant.id, sessionId, doctor, slot, patientName, 'confirmed', pendingRow.id, now, expiresAt);
+
+      toolResult.data = {
+        ...(toolResult.data || {}),
+        bookingRef,
+        actionId: pendingRow.id,
+      };
+      db.prepare('UPDATE pending_actions SET result_json = ? WHERE id = ?').run(
+        JSON.stringify(toolResult),
+        pendingRow.id
+      );
+
+      writeAuditLog({
+        req,
+        actorId: sessionId,
+        actorRole: req?.authUser?.role || 'caller',
+        action: 'appointment.booked',
+        tenantId: tenant.id,
+        targetId: bookingRef,
+        metadata: { doctor, slot, actionId: pendingRow.id },
+      });
+      return toolResult;
+    }
+
+    // reschedule_delivery or other gated action
+    const claim = db
+      .prepare("UPDATE pending_actions SET status = 'completed', idempotency_key = ? WHERE id = ? AND status = 'pending'")
+      .run(idempotencyKey || null, pendingRow.id);
+
+    if (Number(claim.changes || 0) === 0) {
+      const existing = db
+        .prepare('SELECT result_json FROM pending_actions WHERE id = ?')
+        .get(pendingRow.id) as { result_json: string } | undefined;
+      if (existing?.result_json) {
+        try {
+          return JSON.parse(existing.result_json) as ToolExecutionResult;
+        } catch {
+          // continue
+        }
+      }
+    }
+
+    toolResult.data = {
+      ...(toolResult.data || {}),
+      actionId: pendingRow.id,
+    };
+    db.prepare('UPDATE pending_actions SET result_json = ? WHERE id = ?').run(
+      JSON.stringify(toolResult),
+      pendingRow.id
+    );
+    writeAuditLog({
+      req,
+      actorId: sessionId,
+      actorRole: req?.authUser?.role || 'caller',
+      action: `tool.${calledName}.confirmed`,
+      tenantId: tenant.id,
+      targetId: pendingRow.id,
+      metadata: { orderId: callArgs.orderId, newDate: callArgs.newDate },
+    });
+  }
+
+  return toolResult;
 }
 
 // -------------------------------------------------------------
@@ -462,6 +815,7 @@ app.get('/api/session', (req, res) => {
     authenticated: Boolean(user),
     authRequiredForAdmin: true,
     adminBootstrapNeeded: !ADMIN_PASSCODE && !superAdminClaimed,
+    bootstrapRequiresToken: Boolean(ADMIN_BOOTSTRAP_TOKEN),
     passcodeConfigured: Boolean(ADMIN_PASSCODE),
     user: user
       ? {
@@ -474,7 +828,10 @@ app.get('/api/session', (req, res) => {
         }
       : null,
     retentionPolicy: {
-      defaultDays: 30,
+      defaultDays: RETENTION_POLICY_DAYS.defaultTranscriptDays,
+      safetyTicketDays: RETENTION_POLICY_DAYS.safetyTicketDays,
+      supportTicketDays: RETENTION_POLICY_DAYS.supportTicketDays,
+      appointmentDays: RETENTION_POLICY_DAYS.appointmentDays,
       options: [7, 30, 90, 0],
     },
     serverAiActive: Boolean(aiClient),
@@ -510,7 +867,7 @@ app.post('/api/auth/caller-session', (_req, res) => {
   });
 });
 
-app.post('/api/auth/bootstrap', authLimiter, (req, res) => {
+app.post('/api/auth/bootstrap', authLimiter, (req: AuthenticatedRequest, res) => {
   if (ADMIN_PASSCODE) {
     return res.status(403).json({
       error: 'Workspace passcode is configured via ADMIN_PASSCODE. Use standard sign-in instead.',
@@ -522,7 +879,15 @@ app.post('/api/auth/bootstrap', authLimiter, (req, res) => {
     return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid setup input.' });
   }
 
-  const { name, email, password } = parsed.data;
+  const { name, email, password, bootstrapToken } = parsed.data;
+  if (ADMIN_BOOTSTRAP_TOKEN) {
+    if (!bootstrapToken || !constantTimeEqualString(bootstrapToken, ADMIN_BOOTSTRAP_TOKEN)) {
+      return res.status(403).json({
+        error: 'Invalid or missing administrator bootstrap token.',
+      });
+    }
+  }
+
   const normalizedEmail = email.toLowerCase();
 
   if (hasSuperAdminAccount()) {
@@ -542,6 +907,15 @@ app.post('/api/auth/bootstrap', authLimiter, (req, res) => {
   } catch {
     return res.status(409).json({ error: 'Administrator email already exists.' });
   }
+
+  writeAuditLog({
+    req,
+    actorId: userId,
+    actorRole: 'super_admin',
+    action: 'auth.bootstrap',
+    targetId: userId,
+    metadata: { protectedByToken: Boolean(ADMIN_BOOTSTRAP_TOKEN) },
+  });
 
   const token = signSessionToken(
     {
@@ -568,7 +942,7 @@ app.post('/api/auth/bootstrap', authLimiter, (req, res) => {
   });
 });
 
-app.post('/api/auth/login', authLimiter, (req, res) => {
+app.post('/api/auth/login', authLimiter, (req: AuthenticatedRequest, res) => {
   const parsed = AuthLoginSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid credentials payload.' });
@@ -591,6 +965,13 @@ app.post('/api/auth/login', authLimiter, (req, res) => {
       },
       SESSION_SECRET
     );
+    writeAuditLog({
+      req,
+      actorId: 'usr_env_admin',
+      actorRole: 'super_admin',
+      action: 'auth.login',
+      metadata: { method: 'admin_passcode' },
+    });
     return res.json({
       token,
       user: {
@@ -639,6 +1020,14 @@ app.post('/api/auth/login', authLimiter, (req, res) => {
     SESSION_SECRET
   );
 
+  writeAuditLog({
+    req,
+    actorId: row.id,
+    actorRole: row.role,
+    action: 'auth.login',
+    metadata: { method: 'password' },
+  });
+
   return res.json({
     token,
     user: {
@@ -668,7 +1057,7 @@ app.get('/api/auth/users', requireSuperAdmin, (_req, res) => {
   );
 });
 
-app.post('/api/auth/users', requireSuperAdmin, (req, res) => {
+app.post('/api/auth/users', requireSuperAdmin, (req: AuthenticatedRequest, res) => {
   const parsed = TenantAdminCreateSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid user payload.' });
@@ -681,6 +1070,12 @@ app.post('/api/auth/users', requireSuperAdmin, (req, res) => {
     db.prepare(
       'INSERT INTO users (id, email, name, role, allowed_tenants, password_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
     ).run(userId, email.toLowerCase(), name, role, JSON.stringify(allowedTenants), passwordHash, Date.now());
+    writeAuditLog({
+      req,
+      action: 'auth.user_created',
+      targetId: userId,
+      metadata: { role, allowedTenants },
+    });
     return res.status(201).json({
       success: true,
       user: { id: userId, email: email.toLowerCase(), name, role, allowedTenants },
@@ -718,7 +1113,7 @@ app.get('/api/tenants/:id', requireAdmin, (req: AuthenticatedRequest, res) => {
   return res.json(tenant);
 });
 
-app.post('/api/tenants', requireSuperAdmin, (req, res) => {
+app.post('/api/tenants', requireSuperAdmin, (req: AuthenticatedRequest, res) => {
   const parsed = TenantConfigSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid tenant payload' });
@@ -732,6 +1127,12 @@ app.post('/api/tenants', requireSuperAdmin, (req, res) => {
     JSON.stringify(newTenant),
     Date.now()
   );
+  writeAuditLog({
+    req,
+    action: 'tenant.created',
+    tenantId: newTenant.id,
+    targetId: newTenant.id,
+  });
   return res.status(201).json({ success: true, tenant: newTenant });
 });
 
@@ -755,6 +1156,13 @@ app.post('/api/tenants/:id', requireAdmin, (req: AuthenticatedRequest, res) => {
     JSON.stringify(updated),
     Date.now()
   );
+  writeAuditLog({
+    req,
+    action: 'tenant.updated',
+    tenantId: id,
+    targetId: id,
+    metadata: { kbChunks: updated.knowledgeBase.length, toolsCount: updated.tools.length },
+  });
   return res.json({ success: true, tenant: updated });
 });
 
@@ -866,12 +1274,30 @@ app.post('/api/logs', requireAuthenticated, (req: AuthenticatedRequest, res) => 
 
 app.delete('/api/session/data', requireAuthenticated, (req: AuthenticatedRequest, res) => {
   const sessionId = req.authUser!.sessionId;
-  db.prepare('DELETE FROM call_logs WHERE session_id = ?').run(sessionId);
+  const deletedLogs = Number(db.prepare('DELETE FROM call_logs WHERE session_id = ?').run(sessionId).changes || 0);
+  const deletedHandoffs = Number(db.prepare('DELETE FROM handoff_tickets WHERE session_id = ?').run(sessionId).changes || 0);
+  const deletedSupportTickets = Number(db.prepare('DELETE FROM support_tickets WHERE session_id = ?').run(sessionId).changes || 0);
+  const deletedAppointments = Number(db.prepare('DELETE FROM appointments WHERE session_id = ?').run(sessionId).changes || 0);
   db.prepare('DELETE FROM consent_records WHERE session_id = ?').run(sessionId);
   db.prepare('DELETE FROM pending_actions WHERE session_id = ?').run(sessionId);
+
+  writeAuditLog({
+    req,
+    action: 'session.data_deleted',
+    targetId: sessionId,
+    metadata: { deletedLogs, deletedHandoffs, deletedSupportTickets, deletedAppointments },
+  });
+
   return res.json({
     success: true,
-    message: 'All transcripts and preferences for your current session have been deleted.',
+    deleted: {
+      callLogs: deletedLogs,
+      handoffTickets: deletedHandoffs,
+      supportTickets: deletedSupportTickets,
+      appointments: deletedAppointments,
+    },
+    message:
+      'All transcripts, safety handoff tickets, support tickets, appointments, consent records, and pending confirmations for your active session have been permanently deleted.',
   });
 });
 
@@ -885,16 +1311,19 @@ app.delete('/api/logs/all', requireAdmin, (req: AuthenticatedRequest, res) => {
       stmt.run(tid);
     }
   }
+  writeAuditLog({ req, action: 'logs.deleted' });
   return res.json({ success: true, message: 'Authorized tenant call logs deleted.' });
 });
 
-app.post('/api/user/wipe-all', requireSuperAdmin, (_req, res) => {
+app.post('/api/user/wipe-all', requireSuperAdmin, (req: AuthenticatedRequest, res) => {
   try {
     db.exec('DELETE FROM call_logs');
     db.exec('DELETE FROM consent_records');
     db.exec('DELETE FROM support_tickets');
     db.exec('DELETE FROM handoff_tickets');
+    db.exec('DELETE FROM appointments');
     db.exec('DELETE FROM pending_actions');
+    db.exec('DELETE FROM audit_logs');
     db.exec('DELETE FROM tenants');
 
     const insertTenant = db.prepare('INSERT INTO tenants (id, data, updated_at) VALUES (?, ?, ?)');
@@ -902,9 +1331,12 @@ app.post('/api/user/wipe-all', requireSuperAdmin, (_req, res) => {
       insertTenant.run(t.id, JSON.stringify(t), Date.now());
     }
 
+    writeAuditLog({ req, action: 'workspace.wiped' });
+
     return res.json({
       success: true,
-      message: 'All workspace transcripts, consent logs, handoff queues, support tickets, and custom tenants have been permanently wiped.',
+      message:
+        'All workspace transcripts, consent logs, handoff queues, appointments, support tickets, and custom tenants have been permanently wiped.',
       wipedAt: Date.now(),
     });
   } catch (err) {
@@ -971,6 +1403,14 @@ app.patch('/api/handoffs/:id', requireAdmin, (req: AuthenticatedRequest, res) =>
     id
   );
 
+  writeAuditLog({
+    req,
+    action: 'handoff.updated',
+    tenantId: row.tenant_id,
+    targetId: id,
+    metadata: { status: parsed.data.status },
+  });
+
   return res.json({
     success: true,
     ticket: {
@@ -984,6 +1424,113 @@ app.patch('/api/handoffs/:id', requireAdmin, (req: AuthenticatedRequest, res) =>
 });
 
 // -------------------------------------------------------------
+// 8b. Appointments Ledger & Audit Logs (Tenant-Scoped Admin)
+// -------------------------------------------------------------
+app.get('/api/appointments', requireAdmin, (req: AuthenticatedRequest, res) => {
+  const user = req.authUser!;
+  const tenantFilter = typeof req.query.tenantId === 'string' ? req.query.tenantId.trim() : undefined;
+
+  if (tenantFilter && !canAccessTenant(user, tenantFilter)) {
+    return res.status(403).json({ error: 'Forbidden: cannot read appointments for requested tenant.' });
+  }
+
+  const rows = tenantFilter
+    ? (db.prepare('SELECT * FROM appointments WHERE tenant_id = ? ORDER BY created_at DESC').all(tenantFilter) as any[])
+    : (db.prepare('SELECT * FROM appointments ORDER BY created_at DESC').all() as any[]);
+
+  const filtered = rows
+    .filter(r => canAccessTenant(user, r.tenant_id))
+    .map(r => ({
+      id: r.id,
+      tenantId: r.tenant_id,
+      sessionId: r.session_id,
+      doctor: r.doctor,
+      slot: r.slot,
+      patientName: r.patient_name,
+      status: r.status,
+      actionId: r.action_id,
+      createdAt: r.created_at,
+      expiresAt: r.expires_at ?? null,
+    }));
+
+  return res.json(filtered);
+});
+
+app.patch('/api/appointments/:id', requireAdmin, (req: AuthenticatedRequest, res) => {
+  const { id } = req.params;
+  const parsed = AppointmentUpdateSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid appointment update payload.' });
+  }
+
+  const row = db.prepare('SELECT * FROM appointments WHERE id = ?').get(id) as any | undefined;
+  if (!row) {
+    return res.status(404).json({ error: 'Appointment not found.' });
+  }
+  if (!canAccessTenant(req.authUser, row.tenant_id)) {
+    return res.status(403).json({ error: 'Forbidden: cannot modify another tenant appointment.' });
+  }
+
+  db.prepare('UPDATE appointments SET status = ? WHERE id = ?').run(parsed.data.status, id);
+  writeAuditLog({
+    req,
+    action: 'appointment.updated',
+    tenantId: row.tenant_id,
+    targetId: id,
+    metadata: { status: parsed.data.status },
+  });
+
+  return res.json({
+    success: true,
+    appointment: {
+      id: row.id,
+      tenantId: row.tenant_id,
+      doctor: row.doctor,
+      slot: row.slot,
+      patientName: row.patient_name,
+      status: parsed.data.status,
+    },
+  });
+});
+
+app.get('/api/audit-logs', requireAdmin, (req: AuthenticatedRequest, res) => {
+  const user = req.authUser!;
+  const tenantFilter = typeof req.query.tenantId === 'string' ? req.query.tenantId.trim() : undefined;
+
+  if (tenantFilter && !canAccessTenant(user, tenantFilter)) {
+    return res.status(403).json({ error: 'Forbidden: cannot inspect audit logs for requested tenant.' });
+  }
+
+  const rows = tenantFilter
+    ? (db.prepare('SELECT * FROM audit_logs WHERE tenant_id = ? ORDER BY created_at DESC LIMIT 100').all(tenantFilter) as any[])
+    : (db.prepare('SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT 100').all() as any[]);
+
+  const filtered = rows
+    .filter(r => !r.tenant_id || canAccessTenant(user, r.tenant_id))
+    .map(r => {
+      let metadata: Record<string, unknown> = {};
+      try {
+        metadata = JSON.parse(r.metadata || '{}');
+      } catch {
+        metadata = {};
+      }
+      return {
+        id: r.id,
+        traceId: r.trace_id,
+        actorId: r.actor_id,
+        actorRole: r.actor_role,
+        action: r.action,
+        tenantId: r.tenant_id,
+        targetId: r.target_id,
+        metadata,
+        createdAt: r.created_at,
+      };
+    });
+
+  return res.json(filtered);
+});
+
+// -------------------------------------------------------------
 // 9. Health & Support Endpoints
 // -------------------------------------------------------------
 app.get('/api/health', (_req, res) => {
@@ -993,6 +1540,9 @@ app.get('/api/health', (_req, res) => {
     const ticketsCount = (db.prepare('SELECT COUNT(*) as cnt FROM support_tickets').get() as { cnt: number }).cnt;
     const handoffsOpenCount = (
       db.prepare("SELECT COUNT(*) as cnt FROM handoff_tickets WHERE status != 'resolved'").get() as { cnt: number }
+    ).cnt;
+    const appointmentsCount = (
+      db.prepare("SELECT COUNT(*) as cnt FROM appointments WHERE status = 'confirmed'").get() as { cnt: number }
     ).cnt;
 
     res.json({
@@ -1006,6 +1556,7 @@ app.get('/api/health', (_req, res) => {
         logsCount,
         ticketsCount,
         handoffsOpenCount,
+        appointmentsCount,
       },
       geminiAi: {
         configured: Boolean(aiClient),
@@ -1022,23 +1573,47 @@ app.get('/api/health', (_req, res) => {
   }
 });
 
-app.post('/api/support/ticket', (req, res) => {
+app.post('/api/support/ticket', (req: AuthenticatedRequest, res) => {
   const parsed = SupportTicketSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid support ticket payload.' });
   }
 
+  const user = getAuthUser(req);
   const { name, email, subject, message, tenantId } = parsed.data;
-  const ticketId = `VANI-${Math.floor(100000 + Math.random() * 900000)}`;
+  const ticketId = `VANI-${crypto.randomInt(100000, 999999)}`;
+  const now = Date.now();
+  const expiresAt = now + RETENTION_POLICY_DAYS.supportTicketDays * 24 * 60 * 60 * 1000;
 
   db.prepare(
-    'INSERT INTO support_tickets (id, tenant_id, name, email, subject, message, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
-  ).run(ticketId, tenantId || null, name, email, subject || 'General Inquiry', message, 'open', Date.now());
+    'INSERT INTO support_tickets (id, tenant_id, session_id, name, email, subject, message, status, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+  ).run(
+    ticketId,
+    tenantId || null,
+    user?.sessionId || null,
+    name,
+    email,
+    subject || 'General Inquiry',
+    message,
+    'open',
+    now,
+    expiresAt
+  );
+
+  writeAuditLog({
+    req,
+    actorId: user?.sessionId || 'guest',
+    actorRole: user?.role || 'public',
+    action: 'support_ticket.created',
+    tenantId: tenantId || null,
+    targetId: ticketId,
+  });
 
   return res.status(201).json({
     success: true,
     ticketId,
-    message: `Ticket ${ticketId} created successfully. Stored in server support queue for ${email}.`,
+    expiresAt,
+    message: `Ticket ${ticketId} created successfully. Stored in server support queue for ${email} (auto-expires after ${RETENTION_POLICY_DAYS.supportTicketDays} days).`,
   });
 });
 
@@ -1068,8 +1643,10 @@ app.post('/api/turn', requireAuthenticated, turnLimiter, async (req: Authenticat
   // Idempotency short-circuit for repeated submissions
   if (idempotencyKey) {
     const cachedAction = db
-      .prepare('SELECT result_json FROM pending_actions WHERE session_id = ? AND tenant_id = ? AND idempotency_key = ? AND status = ?')
-      .get(sessionId, tenant.id, idempotencyKey, 'completed') as { result_json: string } | undefined;
+      .prepare(
+        "SELECT result_json FROM pending_actions WHERE session_id = ? AND tenant_id = ? AND tool_name = '__turn__' AND idempotency_key = ? AND status = 'completed'"
+      )
+      .get(sessionId, tenant.id, idempotencyKey) as { result_json: string } | undefined;
     if (cachedAction?.result_json) {
       try {
         return res.json(JSON.parse(cachedAction.result_json));
@@ -1092,6 +1669,15 @@ app.post('/api/turn', requireAuthenticated, turnLimiter, async (req: Authenticat
       reason: `Emergency indicator: ${emergencyPreview.symptomDetected || 'Critical symptom'}`,
       priority: 'critical',
       summary: userText,
+    });
+    writeAuditLog({
+      req,
+      actorId: sessionId,
+      actorRole: req.authUser?.role || 'caller',
+      action: 'handoff.created',
+      tenantId: tenant.id,
+      targetId: ticket.id,
+      metadata: { priority: 'critical' },
     });
     const emergencyWithTicket = checkEmergencyCondition(userText, activeLang, tenant, ticket.id)!;
     const elapsed = Math.max(1, Math.round(performance.now() - startTurn));
@@ -1131,6 +1717,15 @@ app.post('/api/turn', requireAuthenticated, turnLimiter, async (req: Authenticat
       priority: 'high',
       summary: userText,
     });
+    writeAuditLog({
+      req,
+      actorId: sessionId,
+      actorRole: req.authUser?.role || 'caller',
+      action: 'handoff.created',
+      tenantId: tenant.id,
+      targetId: ticket.id,
+      metadata: { priority: 'high' },
+    });
     const elapsed = Math.max(1, Math.round(performance.now() - startTurn));
 
     return res.json({
@@ -1163,32 +1758,77 @@ app.post('/api/turn', requireAuthenticated, turnLimiter, async (req: Authenticat
   const ragMs = Math.max(1, Math.round(performance.now() - tRag0));
   let workingMemory: Record<string, string> = extractEntitiesFromInput(userText, memory || {});
 
-  // 5. Explicit Offline Demo Mode when GEMINI_API_KEY is absent
-  if (!aiClient) {
-    if (demoMode) {
-      const demoOut = processTurn({
-        userInput: userText,
+  // 5. Explicit Offline Demo Mode or missing GEMINI_API_KEY fallback
+  if (demoMode) {
+    const demoOut = processTurn({
+      userInput: userText,
+      tenant,
+      currentLanguage: language,
+      callMemory: workingMemory,
+      turnHistory: history as any[],
+    });
+
+    let reply = demoOut.spokenReply;
+    let finalMemory = demoOut.updatedMemory;
+    const demoToolCalls: { name: string; result: any }[] = [];
+
+    if (demoOut.toolInvokedName) {
+      const callArgs: Record<string, any> = {
+        ...(demoOut.toolParams || {}),
+        ...(workingMemory.pendingActionId ? { actionId: workingMemory.pendingActionId } : {}),
+      };
+      const durableResult = executeServerToolWithDurability({
+        calledName: demoOut.toolInvokedName,
+        callArgs,
         tenant,
-        currentLanguage: language,
-        callMemory: workingMemory,
-        turnHistory: history as any[],
+        sessionId,
+        activeLang: demoOut.detectedLanguage,
+        idempotencyKey,
+        req,
       });
-      return res.json({
-        reply: demoOut.spokenReply,
-        language: demoOut.detectedLanguage,
-        switchedLanguage: demoOut.switchedLanguage,
-        toolCalls: demoOut.toolInvokedName
-          ? [{ name: demoOut.toolInvokedName, result: demoOut.toolResult }]
-          : [],
-        shouldHandoff: demoOut.shouldHandoff,
-        handoffReason: demoOut.handoffReason,
-        intent: demoOut.detectedIntent,
-        model: 'offline-deterministic-demo',
-        memoryUpdates: demoOut.updatedMemory,
-        latencyBreakdown: demoOut.latencyBreakdown,
-      });
+      reply = durableResult.outputMessage;
+      demoToolCalls.push({ name: demoOut.toolInvokedName, result: durableResult });
+      finalMemory = extractMemoryUpdatesFromToolCall(
+        demoOut.toolInvokedName,
+        callArgs,
+        durableResult,
+        finalMemory
+      );
     }
 
+    const demoResponseBody = {
+      reply,
+      language: demoOut.detectedLanguage,
+      switchedLanguage: demoOut.switchedLanguage,
+      toolCalls: demoToolCalls,
+      shouldHandoff: demoOut.shouldHandoff,
+      handoffReason: demoOut.handoffReason,
+      intent: demoOut.detectedIntent,
+      model: 'offline-deterministic-demo',
+      memoryUpdates: finalMemory,
+      latencyBreakdown: demoOut.latencyBreakdown,
+    };
+
+    if (idempotencyKey) {
+      db.prepare(
+        'INSERT OR REPLACE INTO pending_actions (id, session_id, tenant_id, tool_name, params_hash, idempotency_key, status, result_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+      ).run(
+        `idem_${crypto.randomUUID().slice(0, 12)}`,
+        sessionId,
+        tenant.id,
+        '__turn__',
+        idempotencyKey,
+        idempotencyKey,
+        'completed',
+        JSON.stringify(demoResponseBody),
+        Date.now()
+      );
+    }
+
+    return res.json(demoResponseBody);
+  }
+
+  if (!aiClient) {
     return res.status(503).json({
       error: 'Gemini AI is not configured on the server (GEMINI_API_KEY missing). Enable Offline Demo Mode in the Voice Console or configure GEMINI_API_KEY.',
       code: 'GEMINI_NOT_CONFIGURED',
@@ -1257,18 +1897,20 @@ app.post('/api/turn', requireAuthenticated, turnLimiter, async (req: Authenticat
 
     activeModelUsed = 'gemini-3.1-flash-lite';
     try {
-      return await invokeModelWithTimeout('gemini-3.1-flash-lite', contents, false, 10000);
+      return await invokeModelWithTimeout('gemini-3.1-flash-lite', contents, false, 6500);
     } catch (liteErr: any) {
       const msg = String(liteErr?.message || liteErr || '');
       const status = Number(liteErr?.status || 0);
+      const isTimedOut = liteErr?.name === 'AbortError' || /Timeout|abort/i.test(msg);
       const isTransient =
-        status === 503 ||
-        status === 429 ||
-        status >= 500 ||
-        /UNAVAILABLE|RESOURCE_EXHAUSTED|ECONNRESET|ETIMEDOUT|fetch failed|Timeout|abort/i.test(msg);
+        !isTimedOut &&
+        (status === 503 ||
+          status === 429 ||
+          status >= 500 ||
+          /UNAVAILABLE|RESOURCE_EXHAUSTED|ECONNRESET|ETIMEDOUT|fetch failed/i.test(msg));
       if (!isTransient) throw liteErr;
-      await new Promise(resolve => setTimeout(resolve, 450));
-      return await invokeModelWithTimeout('gemini-3.1-flash-lite', contents, false, 10000);
+      await new Promise(resolve => setTimeout(resolve, 350));
+      return await invokeModelWithTimeout('gemini-3.1-flash-lite', contents, false, 6500);
     }
   };
 
@@ -1313,46 +1955,20 @@ app.post('/api/turn', requireAuthenticated, turnLimiter, async (req: Authenticat
           continue;
         }
 
-        const callArgs: Record<string, any> = { ...(fc.args || {}) };
-        const requiresConfirmationGate =
-          calledName === 'book_appointment' || calledName === 'reschedule_delivery';
+        const callArgs: Record<string, any> = {
+          ...(fc.args || {}),
+          ...(workingMemory.pendingActionId && !fc.args?.actionId ? { actionId: workingMemory.pendingActionId } : {}),
+        };
 
-        // Durable confirmation state check in SQLite
-        if (requiresConfirmationGate) {
-          const paramsHash = stableParamsHash(callArgs);
-          const pendingRow = db
-            .prepare(
-              'SELECT id FROM pending_actions WHERE session_id = ? AND tenant_id = ? AND tool_name = ? AND status = ? ORDER BY created_at DESC LIMIT 1'
-            )
-            .get(sessionId, tenant.id, calledName, 'pending') as { id: string } | undefined;
-
-          if (callArgs.confirmed && !pendingRow) {
-            // Require explicit confirmation turn before committing irreversible mock state change
-            callArgs.confirmed = false;
-          }
-
-          const toolResult = executeTenantTool(calledName, callArgs, tenant.name, activeLang);
-
-          if (toolResult.requiresConfirmation) {
-            const actionId = pendingRow?.id || `act_${crypto.randomUUID().slice(0, 12)}`;
-            db.prepare(
-              'INSERT OR REPLACE INTO pending_actions (id, session_id, tenant_id, tool_name, params_hash, idempotency_key, status, result_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
-            ).run(actionId, sessionId, tenant.id, calledName, paramsHash, null, 'pending', null, Date.now());
-          } else if (toolResult.success && pendingRow) {
-            db.prepare(
-              'UPDATE pending_actions SET status = ?, idempotency_key = ? WHERE id = ?'
-            ).run('completed', idempotencyKey || null, pendingRow.id);
-          }
-
-          workingMemory = extractMemoryUpdatesFromToolCall(calledName, callArgs, toolResult, workingMemory);
-          executedToolCalls.push({ name: calledName, result: toolResult });
-          functionResponseParts.push({
-            functionResponse: { name: calledName, response: toolResult as unknown as Record<string, any> },
-          });
-          continue;
-        }
-
-        const toolResult = executeTenantTool(calledName, callArgs, tenant.name, activeLang);
+        const toolResult = executeServerToolWithDurability({
+          calledName,
+          callArgs,
+          tenant,
+          sessionId,
+          activeLang,
+          idempotencyKey,
+          req,
+        });
         workingMemory = extractMemoryUpdatesFromToolCall(calledName, callArgs, toolResult, workingMemory);
         executedToolCalls.push({ name: calledName, result: toolResult });
         functionResponseParts.push({
@@ -1415,7 +2031,7 @@ app.post('/api/turn', requireAuthenticated, turnLimiter, async (req: Authenticat
         `idem_${crypto.randomUUID().slice(0, 12)}`,
         sessionId,
         tenant.id,
-        primaryToolName || 'turn',
+        '__turn__',
         idempotencyKey,
         idempotencyKey,
         'completed',
@@ -1433,18 +2049,20 @@ app.post('/api/turn', requireAuthenticated, turnLimiter, async (req: Authenticat
 
     if (errStatus === 429 || /RESOURCE_EXHAUSTED|quota/i.test(errMsg)) {
       return res.status(429).json({
-        error: 'AI quota or rate limit reached. Wait a moment and retry, or check API billing.',
+        error: 'AI quota or rate limit reached. Wait a moment and retry, or switch to Offline Demo Mode.',
         code: 'RESOURCE_EXHAUSTED',
         detail: safeDetail,
         retryable: true,
+        offlineDemoAvailable: true,
       });
     }
     if (errStatus === 401 || errStatus === 403 || /PERMISSION_DENIED|API_KEY_INVALID/i.test(errMsg)) {
       return res.status(403).json({
-        error: 'Gemini API authentication failed. Verify GEMINI_API_KEY configuration.',
+        error: 'Gemini API authentication failed. Verify GEMINI_API_KEY configuration or switch to Offline Demo Mode.',
         code: 'API_KEY_INVALID',
         detail: safeDetail,
         retryable: false,
+        offlineDemoAvailable: true,
       });
     }
     if (errStatus === 404 || /NOT_FOUND/i.test(errMsg)) {
@@ -1453,6 +2071,7 @@ app.post('/api/turn', requireAuthenticated, turnLimiter, async (req: Authenticat
         code: 'MODEL_NOT_FOUND',
         detail: safeDetail,
         retryable: false,
+        offlineDemoAvailable: true,
       });
     }
     if (errStatus === 400 || /INVALID_ARGUMENT/i.test(errMsg)) {
@@ -1465,10 +2084,11 @@ app.post('/api/turn', requireAuthenticated, turnLimiter, async (req: Authenticat
     }
 
     return res.status(502).json({
-      error: 'Unable to generate a response right now due to an upstream AI service error. Please retry.',
+      error: 'Unable to generate a response right now due to an upstream AI service timeout or error. You can retry or switch to Offline Demo Mode.',
       code: 'UPSTREAM_AI_ERROR',
       detail: safeDetail,
       retryable: true,
+      offlineDemoAvailable: true,
     });
   }
 });
@@ -1560,8 +2180,6 @@ app.post('/api/benchmark/run', requireAuthenticated, async (_req, res) => {
 // 12. Dev vs Production Middleware
 // -------------------------------------------------------------
 async function startServer() {
-  const isDev = process.env.NODE_ENV !== 'production';
-
   if (isDev) {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({

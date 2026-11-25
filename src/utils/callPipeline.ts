@@ -23,6 +23,7 @@ export interface ProcessTurnOutput {
   fillerUsed?: string;
   toolResult?: any;
   toolInvokedName?: string;
+  toolParams?: Record<string, any>;
   shouldHandoff: boolean;
   handoffReason?: string;
   isEmergency?: boolean;
@@ -77,8 +78,12 @@ export function extractEntitiesFromInput(text: string, currentMemory: Record<str
     updated.day = 'Saturday';
   }
 
-  // Morning / Evening slot match
-  if (/\b(?:morning|subah|sakale)\b/i.test(lower) || /ସକାଳ/.test(text) || /सुबह/.test(text)) {
+  // Explicit clinic slot or Morning / Evening match
+  const explicitSlotMatch = text.match(/\b(10:00\s*AM|11:30\s*AM|0?4:00\s*PM|0?5:30\s*PM)\b/i);
+  if (explicitSlotMatch) {
+    const raw = explicitSlotMatch[1].toUpperCase().replace(/\s+/g, ' ');
+    updated.timeSlot = raw === '4:00 PM' ? '04:00 PM' : raw === '5:30 PM' ? '05:30 PM' : raw;
+  } else if (/\b(?:morning|subah|sakale)\b/i.test(lower) || /ସକାଳ/.test(text) || /सुबह/.test(text)) {
     updated.timeSlot = 'Morning (10:30 AM)';
   } else if (/\b(?:evening|shaam|sandhya)\b/i.test(lower) || /ସନ୍ଧ୍ୟା/.test(text) || /शाम/.test(text)) {
     updated.timeSlot = 'Evening (05:30 PM)';
@@ -198,9 +203,16 @@ export function processTurn(input: ProcessTurnInput): ProcessTurnOutput {
     if (isBookingIntent || (callMemory.pendingBooking && isConfirmation)) {
       detectedIntent = 'book_appointment';
       toolToInvoke = 'book_appointment';
+      const resolvedSlot = updatedMemory.timeSlot
+        ? updatedMemory.day
+          ? `${updatedMemory.day} ${updatedMemory.timeSlot}`
+          : /^(Morning|Evening)/.test(updatedMemory.timeSlot)
+          ? `Tomorrow ${updatedMemory.timeSlot}`
+          : updatedMemory.timeSlot
+        : updatedMemory.day;
       toolParams = {
         doctor: updatedMemory.doctor,
-        slot: updatedMemory.timeSlot ? `${updatedMemory.day || 'Tomorrow'} ${updatedMemory.timeSlot}` : updatedMemory.day,
+        slot: resolvedSlot,
         patientName: updatedMemory.patientName,
         confirmed: isConfirmation && Boolean(callMemory.pendingAction === 'book_appointment'),
       };
@@ -359,6 +371,7 @@ export function processTurn(input: ProcessTurnInput): ProcessTurnOutput {
     fillerUsed,
     toolResult,
     toolInvokedName: toolToInvoke || undefined,
+    toolParams: toolToInvoke ? toolParams : undefined,
     shouldHandoff: false,
     updatedMemory,
     latencyBreakdown: {

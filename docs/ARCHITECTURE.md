@@ -7,43 +7,44 @@ Browser (LiveVoiceCall.tsx + App.tsx in-memory Bearer token)
   ├─ Web Speech API SpeechRecognition (or typed text / 1-click prompt)
   ├─ Ref-backed state sync (turnsRef, callMemoryRef, activeLanguageRef, isMutedRef, inFlightTurnRef)
   ├─ AbortController + strict single in-flight lock + idempotencyKey
-  └─ POST /api/turn ──▶ Express Server (server.ts)
+  └─ POST /api/turn ──▶ Express Server (server.ts) + X-Trace-Id propagation
                           ├─ 1. Auth & Rate Limiters (Bearer verifySessionToken, 60 turns/min/IP)
-                          ├─ 2. Strict Tenant Lookup (404 TENANT_NOT_FOUND if invalid) + Idempotency Check
+                          ├─ 2. Strict Tenant Lookup (404 TENANT_NOT_FOUND) + __turn__ Idempotency Cache
                           ├─ 3. Language Detection (or / hi / hinglish / bn / en)
                           ├─ 4. Safety Router (Tenant-Aware)
-                          │     ├─ Emergency symptoms -> 112 advice + durable critical ticket in handoff_tickets
-                          │     └─ Explicit human transfer -> durable high ticket in handoff_tickets (honest queue reply)
+                          │     ├─ Emergency symptoms -> 112 advice + durable critical ticket (30d expiry)
+                          │     └─ Explicit human transfer -> durable high ticket in handoff_tickets
                           ├─ 5. Entity Extraction + Cross-Lingual RAG Search (searchKnowledgeBase)
                           ├─ 6. Server AI Generation (or explicit Offline Demo Mode)
                           │     ├─ Gemini multi-turn history + bounded 4000-char KB digest
                           │     ├─ Per-tenant tool allowlist verification
-                          │     └─ Durable SQLite confirmation gate (pending_actions) -> functionResponse loop
+                          │     └─ Exact paramsHash + immutable actionId confirmation gate
+                          │           └─ Clinic SQLite appointments ledger & double-booking guard
                           └─ 7. JSON Response (real ragMs / modelResponseMs / totalTurnaroundMs) -> TTS + Transcript
 ```
 
 ---
 
-## 2. Authentication, RBAC & In-Memory Token Architecture (`src/utils/auth.ts`, `App.tsx`)
+## 2. Authentication, Production Guards & RBAC (`src/utils/auth.ts`, `src/utils/actionConfirmation.ts`)
 
-- **Caller vs. Admin Sessions**:
-  - Every browser visit acquires a short-lived `caller` token (`POST /api/auth/caller-session`) scoped to a unique `sessionId`, enabling voice turns, session-scoped DPDP consent/deletion, and session-only transcript recall without granting administrative visibility.
-  - Administrative operations (viewing cross-tenant logs, modifying knowledge bases/voice configs, creating tenants, acknowledging/resolving queued handoff tickets, and global wipes) require a signed `tenant_admin` or `super_admin` token.
-- **No Browser Storage of Tokens**: Bearer tokens reside strictly in React component memory (`App.tsx`), avoiding persistent browser-storage exposure.
+- **Fail-Fast Production Startup**: `npm start` (`node server.ts`) runs in production mode unless `--dev` or `NODE_ENV=development` is active. `verifyProductionSecurityConfig()` blocks production startup if `SESSION_SECRET` is missing or `< 32` chars, or if no admin protection mechanism (`ADMIN_PASSCODE`, `ADMIN_BOOTSTRAP_TOKEN`, or an existing SQLite `super_admin`) is present.
+- **Protected Bootstrap**: If `ADMIN_BOOTSTRAP_TOKEN` is set, claiming first-run super-admin via `POST /api/auth/bootstrap` requires submitting the token in constant time.
+- **No Browser Storage of Tokens**: Bearer tokens reside strictly in React component memory (`App.tsx`).
 - **Password Storage**: Administrator credentials stored in SQLite `users` use a random 16-byte salt per account with `crypto.scryptSync` and constant-time comparison (`crypto.timingSafeEqual`).
 
 ---
 
-## 3. Generative AI, Tool Allowlists & Confirmation Persistence (`src/utils/geminiTurnBuilder.ts`, `server.ts`)
+## 3. Exact Confirmation Matching & Appointments Ledger (`server.ts`, `src/utils/actionConfirmation.ts`)
 
-1. **Primary & Cooldown Fallback Models**:
-   - Uses `gemini-4-hydrogen` (`ThinkingLevel.LOW`, `3500ms` timeout) with automatic 120-second cooldown failover to `gemini-3.1-flash-lite` on `429`/`503`/timeouts.
-   - If `GEMINI_API_KEY` is unconfigured, the server does **not** silently fall back on live calls unless `demoMode: true` is explicitly toggled by the user.
-2. **Bounded Context & Non-Scripted Guidance**:
-   - `buildTenantSystemInstruction` supplies top RAG matches alongside up to `4000` characters of remaining tenant KB chunks so prompts remain predictable and cost-bounded.
-3. **Per-Tenant Allowlists & Durable Confirmation (`pending_actions`)**:
-   - Even if a model hallucinates an unauthorized tool name, `server.ts` blocks execution unless the tool is defined on that tenant.
-   - Irreversible mock actions (`book_appointment`, `reschedule_delivery`) check SQLite `pending_actions` so `confirmed: true` cannot skip the confirmation turn.
+1. **Canonical Parameter Hashing (`canonicalizeToolParams`)**:
+   - Strips confirmation control keys (`confirmed`, `actionId`), normalizes whitespace/casing, and hashes `{ toolName, params }` with SHA-256 into `paramsHash`.
+   - When `book_appointment` or `reschedule_delivery` requires confirmation, SQLite `pending_actions` stores an immutable `actionId` (`act_<uuid>`) and `params_hash`.
+   - Confirming with mismatched/tampered parameters fails safely back to a fresh confirmation prompt rather than committing altered arguments.
+   - Confirmed rows transition atomically (`UPDATE pending_actions SET status = 'completed' WHERE id = ? AND status = 'pending'`) and store `result_json` for idempotent replay.
+2. **SQLite Clinic Appointments Ledger (`appointments`)**:
+   - `check_slot_availability` dynamically filters confirmed SQLite bookings for the requested doctor.
+   - `book_appointment` prevents double-booking of `(tenant_id, doctor, slot)` across concurrent callers and inserts a `confirmed` appointment (`90`-day retention expiry).
+   - Admins can inspect and cancel booked slots in `CallLogsTab.tsx` (`PATCH /api/appointments/:id`), immediately freeing the slot.
 
 ---
 
@@ -51,12 +52,11 @@ Browser (LiveVoiceCall.tsx + App.tsx in-memory Bearer token)
 
 - Synchronous ref + React state updaters prevent stale closures in long-lived Web Speech `onstart`, `onresult`, `onerror`, and `onend` listeners.
 - `src/utils/speechRecognition.ts` classifies fatal (`not-allowed`, `service-not-allowed`) vs. benign (`no-speech`, `aborted`) errors, enforces bounded exponential backoff (`150ms`–`3000ms`), and cleans up timers on unmount.
-- Transparently informs users when browser `speechSynthesis` lacks a native Odia (`or-IN`) voice and uses Indian phonetic fallback speech alongside native Odia script.
 
 ---
 
-## 5. Persistence & Scheduled Retention Cleanup (`server.ts`)
+## 5. Persistence, Audit Trail & Scheduled Cleanup (`server.ts`)
 
-- **7 SQLite Tables (`vanivoice.db`)**: `tenants`, `call_logs` (with `session_id`, `expires_at`), `consent_records`, `support_tickets`, `handoff_tickets`, `pending_actions`, and `users`.
-- **Automatic Expiry Worker**: Startup sweep plus a 15-minute `setInterval(...).unref()` deletes rows where `expires_at <= Date.now()`.
-- **Node 22 Native ESM (`node server.ts`)**: All server imports use explicit `.ts` extensions and `import type`, with Vite loaded lazily only when `NODE_ENV !== 'production'`.
+- **9 SQLite Tables (`vanivoice.db`)**: `tenants`, `call_logs`, `consent_records`, `support_tickets`, `handoff_tickets`, `pending_actions`, `users`, `appointments`, and `audit_logs`.
+- **Automatic Expiry Worker**: Startup sweep plus a 15-minute `setInterval(...).unref()` deletes expired `call_logs`, `handoff_tickets` (30d), `support_tickets` (90d), `appointments` (90d), and stale pending confirmations (24h).
+- **Node 22 Native ESM (`node server.ts`)**: All server imports use explicit `.ts` extensions and `import type`, with Vite loaded lazily only when `--dev` or `NODE_ENV=development` is active.

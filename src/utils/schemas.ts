@@ -123,6 +123,7 @@ export const AuthBootstrapSchema = z.object({
   name: z.string().trim().min(2).max(80),
   email: z.string().trim().email().max(160),
   password: z.string().min(8, 'Password must be at least 8 characters').max(128),
+  bootstrapToken: z.string().trim().max(256).optional(),
 });
 
 export const AuthLoginSchema = z.object({
@@ -141,4 +142,8 @@ export const TenantAdminCreateSchema = z.object({
 export const HandoffUpdateSchema = z.object({
   status: z.enum(['queued', 'acknowledged', 'resolved']),
   notes: z.string().trim().max(500).optional(),
+});
+
+export const AppointmentUpdateSchema = z.object({
+  status: z.enum(['confirmed', 'cancelled']),
 });
