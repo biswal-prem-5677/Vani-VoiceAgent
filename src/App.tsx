@@ -3,22 +3,12 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, lazy, Suspense } from 'react';
 import { Navbar, ActiveTab } from './components/Navbar';
 import { LiveVoiceCall } from './components/LiveVoiceCall';
-import { KnowledgeBaseTab } from './components/KnowledgeBaseTab';
-import { VoiceConfigTab } from './components/VoiceConfigTab';
-import { CallLogsTab } from './components/CallLogsTab';
-import { EvaluationTab } from './components/EvaluationTab';
-import { WidgetEmbedSimulator } from './components/WidgetEmbedSimulator';
-import { NewTenantModal } from './components/NewTenantModal';
 import { ConsentBanner, ConsentChoice } from './components/ConsentBanner';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { OfflineIndicator } from './components/OfflineIndicator';
-import { LegalModal } from './components/LegalModal';
-import { SupportDeskModal } from './components/SupportDeskModal';
-import { SystemStatusModal } from './components/SystemStatusModal';
-import { ShareModal } from './components/ShareModal';
 import { AdminAuthPanel } from './components/AdminAuthPanel';
 import { INITIAL_TENANTS } from './data/tenants';
 import {
@@ -34,14 +24,38 @@ import {
   WorkspaceUserRecord,
 } from './types';
 import { testConnection, getFirebaseAuth, signOutFirebase } from './lib/firebase';
-import {
-  syncTenantWorkspaceToFirestore,
-  persistCallSessionToFirestore,
-  persistHandoffToFirestore,
-  updateHandoffInFirestore,
-  updateAppointmentInFirestore,
-  deleteUserSessionDocsFromFirestore,
-} from './lib/firestoreStore';
+import { syncTenantWorkspaceToFirestore } from './lib/firestoreStore';
+
+const KnowledgeBaseTab = lazy(() =>
+  import('./components/KnowledgeBaseTab').then(m => ({ default: m.KnowledgeBaseTab }))
+);
+const VoiceConfigTab = lazy(() =>
+  import('./components/VoiceConfigTab').then(m => ({ default: m.VoiceConfigTab }))
+);
+const CallLogsTab = lazy(() =>
+  import('./components/CallLogsTab').then(m => ({ default: m.CallLogsTab }))
+);
+const EvaluationTab = lazy(() =>
+  import('./components/EvaluationTab').then(m => ({ default: m.EvaluationTab }))
+);
+const WidgetEmbedSimulator = lazy(() =>
+  import('./components/WidgetEmbedSimulator').then(m => ({ default: m.WidgetEmbedSimulator }))
+);
+const NewTenantModal = lazy(() =>
+  import('./components/NewTenantModal').then(m => ({ default: m.NewTenantModal }))
+);
+const LegalModal = lazy(() =>
+  import('./components/LegalModal').then(m => ({ default: m.LegalModal }))
+);
+const SupportDeskModal = lazy(() =>
+  import('./components/SupportDeskModal').then(m => ({ default: m.SupportDeskModal }))
+);
+const SystemStatusModal = lazy(() =>
+  import('./components/SystemStatusModal').then(m => ({ default: m.SystemStatusModal }))
+);
+const ShareModal = lazy(() =>
+  import('./components/ShareModal').then(m => ({ default: m.ShareModal }))
+);
 import {
   Globe2,
   ShieldCheck,
@@ -365,10 +379,6 @@ export default function App() {
   const handleCallEnded = (newLog: CallLog, persisted: boolean) => {
     if (persisted) {
       setCallLogs(prev => [newLog, ...prev]);
-      const fbUid = getFirebaseAuth().currentUser?.uid;
-      if (fbUid && consentChoice.retentionDays > 0) {
-        void persistCallSessionToFirestore(newLog, fbUid, consentChoice.retentionDays).catch(() => {});
-      }
     }
     if (isAdmin && authToken) {
       loadAdminWorkspaceData(authToken, authUser?.role);
@@ -376,10 +386,6 @@ export default function App() {
   };
 
   const handleHandoffCreated = (ticket: HandoffTicket) => {
-    const fbUid = getFirebaseAuth().currentUser?.uid;
-    if (fbUid) {
-      void persistHandoffToFirestore(ticket, fbUid).catch(() => {});
-    }
     if (isAdmin) {
       setHandoffs(prev => [ticket, ...prev]);
     }
@@ -405,9 +411,6 @@ export default function App() {
     setHandoffs(prev =>
       prev.map(h => (h.id === id ? { ...h, status, updatedAt: Date.now() } : h))
     );
-    if (getFirebaseAuth().currentUser?.uid) {
-      void updateHandoffInFirestore(id, status).catch(() => {});
-    }
   };
 
   const handleUpdateAppointmentStatus = async (
@@ -430,9 +433,6 @@ export default function App() {
     setAppointments(prev => prev.map(a => (a.id === id ? { ...a, status } : a)));
     if (data?.integrationDelivery) {
       setIntegrations(prev => [data.integrationDelivery, ...prev]);
-    }
-    if (getFirebaseAuth().currentUser?.uid) {
-      void updateAppointmentInFirestore(id, status).catch(() => {});
     }
   };
 
@@ -493,10 +493,6 @@ export default function App() {
 
   const handleClearLogs = () => {
     setCallLogs([]);
-    const fbUid = getFirebaseAuth().currentUser?.uid;
-    if (fbUid && !isAdmin) {
-      void deleteUserSessionDocsFromFirestore(fbUid).catch(() => {});
-    }
   };
 
   const canPersistLogs = consentChoice.consented && consentChoice.retentionDays > 0;
@@ -590,77 +586,85 @@ export default function App() {
             />
           )}
 
-          {activeTab === 'knowledge' && (
-            isAdmin ? (
-              <KnowledgeBaseTab
-                key={`kb_${activeTenant.id}`}
-                tenant={activeTenant}
-                onUpdateKnowledgeBase={handleUpdateKnowledgeBase}
-              />
-            ) : (
-              <div className="py-8">
-                <AdminAuthPanel
-                  adminBootstrapNeeded={sessionMeta.adminBootstrapNeeded}
-                  bootstrapRequiresToken={sessionMeta.bootstrapRequiresToken}
-                  passcodeConfigured={sessionMeta.passcodeConfigured}
-                  onAuthenticated={handleAdminAuthenticated}
-                  title="Sign In to Manage Knowledge Base"
-                  subtitle="Tenant system prompts and document collections are restricted to authorized tenant administrators."
-                />
+          <Suspense
+            fallback={
+              <div className="p-8 rounded-2xl bg-[#0D111A] border border-white/[0.08] text-xs text-slate-400 text-center font-mono">
+                Loading workspace module...
               </div>
-            )
-          )}
-
-          {activeTab === 'voice' && (
-            isAdmin ? (
-              <VoiceConfigTab
-                key={`voice_${activeTenant.id}`}
-                tenant={activeTenant}
-                onUpdateTenant={handleUpdateTenantConfig}
-              />
-            ) : (
-              <div className="py-8">
-                <AdminAuthPanel
-                  adminBootstrapNeeded={sessionMeta.adminBootstrapNeeded}
-                  bootstrapRequiresToken={sessionMeta.bootstrapRequiresToken}
-                  passcodeConfigured={sessionMeta.passcodeConfigured}
-                  onAuthenticated={handleAdminAuthenticated}
-                  title="Sign In to Configure Voice & Tools"
-                  subtitle="Voice persona parameters, escalation contacts, and tool definitions require tenant administrator access."
+            }
+          >
+            {activeTab === 'knowledge' && (
+              isAdmin ? (
+                <KnowledgeBaseTab
+                  key={`kb_${activeTenant.id}`}
+                  tenant={activeTenant}
+                  onUpdateKnowledgeBase={handleUpdateKnowledgeBase}
                 />
-              </div>
-            )
-          )}
+              ) : (
+                <div className="py-8">
+                  <AdminAuthPanel
+                    adminBootstrapNeeded={sessionMeta.adminBootstrapNeeded}
+                    bootstrapRequiresToken={sessionMeta.bootstrapRequiresToken}
+                    passcodeConfigured={sessionMeta.passcodeConfigured}
+                    onAuthenticated={handleAdminAuthenticated}
+                    title="Sign In to Manage Knowledge Base"
+                    subtitle="Tenant system prompts and document collections are restricted to authorized tenant administrators."
+                  />
+                </div>
+              )
+            )}
 
-          {activeTab === 'logs' && (
-            <CallLogsTab
-              logs={callLogs}
-              handoffs={handoffs}
-              appointments={appointments}
-              auditLogs={auditLogs}
-              integrations={integrations}
-              operationalMetrics={operationalMetrics}
-              workspaceUsers={workspaceUsers}
-              isAdmin={isAdmin}
-              isSuperAdmin={isSuperAdmin}
-              authToken={authToken}
-              onClearLogs={handleClearLogs}
-              onUpdateHandoffStatus={handleUpdateHandoffStatus}
-              onUpdateAppointmentStatus={handleUpdateAppointmentStatus}
-              onRetryIntegration={handleRetryIntegration}
-              onUpdateUserRole={handleUpdateUserRole}
-              onToggleUserRevoke={handleToggleUserRevoke}
-              onOpenAuth={() => setIsAuthModalOpen(true)}
-            />
-          )}
+            {activeTab === 'voice' && (
+              isAdmin ? (
+                <VoiceConfigTab
+                  key={`voice_${activeTenant.id}`}
+                  tenant={activeTenant}
+                  onUpdateTenant={handleUpdateTenantConfig}
+                />
+              ) : (
+                <div className="py-8">
+                  <AdminAuthPanel
+                    adminBootstrapNeeded={sessionMeta.adminBootstrapNeeded}
+                    bootstrapRequiresToken={sessionMeta.bootstrapRequiresToken}
+                    passcodeConfigured={sessionMeta.passcodeConfigured}
+                    onAuthenticated={handleAdminAuthenticated}
+                    title="Sign In to Configure Voice & Tools"
+                    subtitle="Voice persona parameters, escalation contacts, and tool definitions require tenant administrator access."
+                  />
+                </div>
+              )
+            )}
 
-          {activeTab === 'eval' && (
-            <EvaluationTab authToken={authToken} />
-          )}
+            {activeTab === 'logs' && (
+              <CallLogsTab
+                logs={callLogs}
+                handoffs={handoffs}
+                appointments={appointments}
+                auditLogs={auditLogs}
+                integrations={integrations}
+                operationalMetrics={operationalMetrics}
+                workspaceUsers={workspaceUsers}
+                isAdmin={isAdmin}
+                isSuperAdmin={isSuperAdmin}
+                authToken={authToken}
+                onClearLogs={handleClearLogs}
+                onUpdateHandoffStatus={handleUpdateHandoffStatus}
+                onUpdateAppointmentStatus={handleUpdateAppointmentStatus}
+                onRetryIntegration={handleRetryIntegration}
+                onUpdateUserRole={handleUpdateUserRole}
+                onToggleUserRevoke={handleToggleUserRevoke}
+                onOpenAuth={() => setIsAuthModalOpen(true)}
+              />
+            )}
 
-          {activeTab === 'widget' && (
-            <WidgetEmbedSimulator key={`widget_${activeTenant.id}`} tenant={activeTenant} />
-          )}
+            {activeTab === 'eval' && (
+              <EvaluationTab authToken={authToken} />
+            )}
+
+            {activeTab === 'widget' && (
+              <WidgetEmbedSimulator key={`widget_${activeTenant.id}`} tenant={activeTenant} />
+            )}
+          </Suspense>
         </main>
 
         {/* Compliant Production Footer */}
@@ -732,46 +736,60 @@ export default function App() {
           </div>
         )}
 
-        <NewTenantModal
-          isOpen={isNewTenantModalOpen}
-          onClose={() => setIsNewTenantModalOpen(false)}
-          onTenantCreated={handleTenantCreated}
-        />
+        <Suspense fallback={null}>
+          {isNewTenantModalOpen && (
+            <NewTenantModal
+              isOpen={isNewTenantModalOpen}
+              onClose={() => setIsNewTenantModalOpen(false)}
+              onTenantCreated={handleTenantCreated}
+            />
+          )}
 
-        <LegalModal
-          isOpen={isLegalModalOpen}
-          onClose={() => setIsLegalModalOpen(false)}
-          authToken={authToken}
-          authUser={authUser}
-          onDataWiped={scope => {
-            setCallLogs([]);
-            if (scope === 'workspace' && authToken) {
-              setHandoffs([]);
-              setAppointments([]);
-              setAuditLogs([]);
-              setIntegrations([]);
-              setOperationalMetrics(null);
-              loadAdminWorkspaceData(authToken, authUser?.role);
-            }
-          }}
-        />
+          {isLegalModalOpen && (
+            <LegalModal
+              isOpen={isLegalModalOpen}
+              onClose={() => setIsLegalModalOpen(false)}
+              authToken={authToken}
+              authUser={authUser}
+              onDataWiped={scope => {
+                setCallLogs([]);
+                if (scope === 'workspace' && authToken) {
+                  setHandoffs([]);
+                  setAppointments([]);
+                  setAuditLogs([]);
+                  setIntegrations([]);
+                  setOperationalMetrics(null);
+                  loadAdminWorkspaceData(authToken, authUser?.role);
+                }
+              }}
+            />
+          )}
 
-        <SupportDeskModal
-          isOpen={isSupportModalOpen}
-          onClose={() => setIsSupportModalOpen(false)}
-          authToken={authToken}
-          tenantId={activeTenant.id}
-        />
+          {isSupportModalOpen && (
+            <SupportDeskModal
+              isOpen={isSupportModalOpen}
+              onClose={() => setIsSupportModalOpen(false)}
+              authToken={authToken}
+              tenantId={activeTenant.id}
+            />
+          )}
 
-        <SystemStatusModal
-          isOpen={isStatusModalOpen}
-          onClose={() => setIsStatusModalOpen(false)}
-        />
+          {isStatusModalOpen && (
+            <SystemStatusModal
+              isOpen={isStatusModalOpen}
+              onClose={() => setIsStatusModalOpen(false)}
+              authToken={authToken}
+              isAdmin={isAdmin}
+            />
+          )}
 
-        <ShareModal
-          isOpen={isShareModalOpen}
-          onClose={() => setIsShareModalOpen(false)}
-        />
+          {isShareModalOpen && (
+            <ShareModal
+              isOpen={isShareModalOpen}
+              onClose={() => setIsShareModalOpen(false)}
+            />
+          )}
+        </Suspense>
       </div>
     </ErrorBoundary>
   );

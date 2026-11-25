@@ -64,6 +64,7 @@ import {
   buildCalendarIcs,
 } from './src/utils/externalIntegration.ts';
 import { computeOperationalMetrics } from './src/utils/operationalMetrics.ts';
+import { logHttpCompletion, logStructuredEvent } from './src/utils/logger.ts';
 import type { TenantConfig, CallLog, HandoffTicket, SupportedLanguage, IntegrationDelivery } from './src/types/index.ts';
 
 const app = express();
@@ -74,12 +75,31 @@ const isDev = process.argv.includes('--dev') || process.env.NODE_ENV === 'develo
 const RAW_SESSION_SECRET = process.env.SESSION_SECRET?.trim() || '';
 const ADMIN_PASSCODE = process.env.ADMIN_PASSCODE?.trim() || '';
 const ADMIN_BOOTSTRAP_TOKEN = process.env.ADMIN_BOOTSTRAP_TOKEN?.trim() || '';
-const ADMIN_EMAIL = (process.env.ADMIN_EMAIL?.trim() || 'priyabratabiswal567@gmail.com').toLowerCase();
+const ADMIN_EMAIL = process.env.ADMIN_EMAIL?.trim().toLowerCase() || '';
 const ALLOW_LOCAL_WEBHOOKS = process.env.ALLOW_LOCAL_WEBHOOKS === 'true';
 const WEBHOOK_SIGNING_SECRET = process.env.WEBHOOK_SIGNING_SECRET?.trim() || '';
+const CSP_FRAME_ANCESTORS =
+  process.env.CSP_FRAME_ANCESTORS?.trim() ||
+  "'self' https://aistudio.google.com https://*.google.com";
 
-// Security headers & X-Trace-Id propagation (iframe-compatible for preview environments)
-app.use((req: Request & { traceId?: string }, res: Response, next: NextFunction) => {
+const CONTENT_SECURITY_POLICY = [
+  "default-src 'self'",
+  isDev
+    ? "script-src 'self' 'unsafe-inline' https://apis.google.com https://www.gstatic.com"
+    : "script-src 'self' https://apis.google.com https://www.gstatic.com",
+  "style-src 'self' 'unsafe-inline'",
+  "img-src 'self' data: https:",
+  "font-src 'self' data:",
+  "connect-src 'self' https://*.googleapis.com https://identitytoolkit.googleapis.com https://securetoken.googleapis.com https://*.firebaseio.com https://*.firebaseapp.com wss://*.firebaseio.com",
+  "frame-src 'self' https://accounts.google.com https://*.firebaseapp.com https://*.google.com",
+  "object-src 'none'",
+  "base-uri 'self'",
+  `frame-ancestors ${CSP_FRAME_ANCESTORS}`,
+].join('; ');
+
+// Security headers, CSP, redacted JSON request logging & X-Trace-Id propagation
+app.use((req: Request & { traceId?: string; authUser?: SessionTokenPayload }, res: Response, next: NextFunction) => {
+  const startReq = performance.now();
   const incomingTrace = typeof req.headers['x-trace-id'] === 'string' ? req.headers['x-trace-id'].trim() : '';
   const traceId = incomingTrace && incomingTrace.length <= 64 ? incomingTrace : crypto.randomUUID();
   req.traceId = traceId;
@@ -87,9 +107,17 @@ app.use((req: Request & { traceId?: string }, res: Response, next: NextFunction)
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
   res.setHeader('Permissions-Policy', 'microphone=(self)');
+  res.setHeader('Content-Security-Policy', CONTENT_SECURITY_POLICY);
   if (req.path.startsWith('/api/')) {
     res.setHeader('Cache-Control', 'no-store');
   }
+  res.on('finish', () => {
+    logHttpCompletion({
+      req,
+      statusCode: res.statusCode,
+      durationMs: performance.now() - startReq,
+    });
+  });
   next();
 });
 
@@ -259,6 +287,7 @@ ensureColumn('support_tickets', 'expires_at', 'INTEGER');
 ensureColumn('handoff_tickets', 'expires_at', 'INTEGER');
 ensureColumn('users', 'revoked', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('users', 'auth_provider', "TEXT NOT NULL DEFAULT 'workspace_local'");
+ensureColumn('users', 'token_version', 'INTEGER NOT NULL DEFAULT 1');
 
 // Backfill retention expiry for any pre-existing safety/support tickets missing expires_at
 db.prepare('UPDATE handoff_tickets SET expires_at = created_at + ? WHERE expires_at IS NULL').run(
@@ -444,11 +473,14 @@ interface DbUserRow {
   allowed_tenants: string;
   revoked: number;
   auth_provider: string;
+  token_version: number;
 }
 
 function upsertFirebaseUserRecord(claims: { uid: string; email: string; name: string }): DbUserRow | null {
   const existing = db
-    .prepare('SELECT id, email, name, role, allowed_tenants, revoked, auth_provider FROM users WHERE email = ? OR id = ?')
+    .prepare(
+      'SELECT id, email, name, role, allowed_tenants, revoked, auth_provider, token_version FROM users WHERE email = ? OR id = ?'
+    )
     .get(claims.email.toLowerCase(), `fb_${claims.uid}`) as DbUserRow | undefined;
 
   if (existing) {
@@ -456,13 +488,13 @@ function upsertFirebaseUserRecord(claims: { uid: string; email: string; name: st
     return existing;
   }
 
-  const isPrimaryAdmin = claims.email.toLowerCase() === ADMIN_EMAIL;
+  const isPrimaryAdmin = Boolean(ADMIN_EMAIL && claims.email.toLowerCase() === ADMIN_EMAIL);
   const role: DbUserRow['role'] = isPrimaryAdmin ? 'super_admin' : 'caller';
   const allowedTenantsJson = JSON.stringify(isPrimaryAdmin ? ['*'] : []);
   const id = `fb_${claims.uid}`;
   db.prepare(
-    'INSERT INTO users (id, email, name, role, allowed_tenants, password_hash, revoked, auth_provider, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
-  ).run(id, claims.email.toLowerCase(), claims.name, role, allowedTenantsJson, 'oidc_federated', 0, 'firebase_oidc', Date.now());
+    'INSERT INTO users (id, email, name, role, allowed_tenants, password_hash, revoked, auth_provider, token_version, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+  ).run(id, claims.email.toLowerCase(), claims.name, role, allowedTenantsJson, 'oidc_federated', 0, 'firebase_oidc', 1, Date.now());
 
   return {
     id,
@@ -472,6 +504,7 @@ function upsertFirebaseUserRecord(claims: { uid: string; email: string; name: st
     allowed_tenants: allowedTenantsJson,
     revoked: 0,
     auth_provider: 'firebase_oidc',
+    token_version: 1,
   };
 }
 
@@ -483,19 +516,23 @@ async function resolveAuthUser(req: Request): Promise<SessionTokenPayload | null
   // 1. Check workspace-signed session token first (fast HMAC path)
   const localClaims = verifySessionToken(token, SESSION_SECRET);
   if (localClaims) {
-    // Re-read live DB role & revocation status on every request so role/revocation changes take immediate effect
+    // Re-read live DB role, token_version & revocation status on every request
     if (localClaims.sub !== 'usr_env_admin' && (localClaims.sub.startsWith('usr_') || localClaims.sub.startsWith('fb_'))) {
       const row = db
-        .prepare('SELECT id, email, name, role, allowed_tenants, revoked FROM users WHERE id = ?')
+        .prepare('SELECT id, email, name, role, allowed_tenants, revoked, token_version FROM users WHERE id = ?')
         .get(localClaims.sub) as DbUserRow | undefined;
       if (row) {
         if (row.revoked === 1) return null;
+        if (typeof localClaims.ver === 'number' && row.token_version !== localClaims.ver) {
+          return null;
+        }
         return {
           ...localClaims,
           email: row.email,
           name: row.name,
           role: row.role,
           allowedTenants: JSON.parse(row.allowed_tenants),
+          ver: row.token_version,
         };
       }
     }
@@ -517,6 +554,7 @@ async function resolveAuthUser(req: Request): Promise<SessionTokenPayload | null
     name: userRow.name,
     role: userRow.role,
     allowedTenants: JSON.parse(userRow.allowed_tenants),
+    ver: userRow.token_version,
     iat: nowSec,
     exp: nowSec + 3600,
   };
@@ -1154,8 +1192,8 @@ app.post('/api/auth/bootstrap', authLimiter, (req: AuthenticatedRequest, res) =>
 
   try {
     db.prepare(
-      'INSERT INTO users (id, email, name, role, allowed_tenants, password_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
-    ).run(userId, normalizedEmail, name, 'super_admin', JSON.stringify(['*']), passwordHash, Date.now());
+      'INSERT INTO users (id, email, name, role, allowed_tenants, password_hash, revoked, auth_provider, token_version, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+    ).run(userId, normalizedEmail, name, 'super_admin', JSON.stringify(['*']), passwordHash, 0, 'workspace_local', 1, Date.now());
   } catch {
     return res.status(409).json({ error: 'Administrator email already exists.' });
   }
@@ -1177,6 +1215,7 @@ app.post('/api/auth/bootstrap', authLimiter, (req: AuthenticatedRequest, res) =>
       name,
       role: 'super_admin',
       allowedTenants: ['*'],
+      ver: 1,
     },
     SESSION_SECRET
   );
@@ -1243,7 +1282,7 @@ app.post('/api/auth/login', authLimiter, (req: AuthenticatedRequest, res) => {
   }
 
   const row = db
-    .prepare('SELECT id, email, name, role, allowed_tenants, password_hash, revoked FROM users WHERE email = ?')
+    .prepare('SELECT id, email, name, role, allowed_tenants, password_hash, revoked, token_version FROM users WHERE email = ?')
     .get(email.toLowerCase()) as
     | {
         id: string;
@@ -1253,6 +1292,7 @@ app.post('/api/auth/login', authLimiter, (req: AuthenticatedRequest, res) => {
         allowed_tenants: string;
         password_hash: string;
         revoked: number;
+        token_version: number;
       }
     | undefined;
 
@@ -1272,6 +1312,7 @@ app.post('/api/auth/login', authLimiter, (req: AuthenticatedRequest, res) => {
       name: row.name,
       role: row.role,
       allowedTenants,
+      ver: row.token_version || 1,
     },
     SESSION_SECRET
   );
@@ -1330,6 +1371,7 @@ app.post('/api/auth/firebase', authLimiter, async (req: AuthenticatedRequest, re
       name: userRow.name,
       role: userRow.role,
       allowedTenants,
+      ver: userRow.token_version || 1,
     },
     SESSION_SECRET
   );
@@ -1426,7 +1468,7 @@ app.patch('/api/auth/users/:id/role', requireSuperAdmin, (req: AuthenticatedRequ
       ? parsed.data.allowedTenants
       : JSON.parse(row.allowed_tenants);
 
-  db.prepare('UPDATE users SET role = ?, allowed_tenants = ? WHERE id = ?').run(
+  db.prepare('UPDATE users SET role = ?, allowed_tenants = ?, token_version = token_version + 1 WHERE id = ?').run(
     parsed.data.role,
     JSON.stringify(nextTenants),
     id
@@ -1461,7 +1503,10 @@ app.post('/api/auth/users/:id/revoke', requireSuperAdmin, (req: AuthenticatedReq
     return res.status(404).json({ error: 'User not found.' });
   }
 
-  db.prepare('UPDATE users SET revoked = ? WHERE id = ?').run(parsed.data.revoked ? 1 : 0, id);
+  db.prepare('UPDATE users SET revoked = ?, token_version = token_version + 1 WHERE id = ?').run(
+    parsed.data.revoked ? 1 : 0,
+    id
+  );
   writeAuditLog({
     req,
     action: parsed.data.revoked ? 'auth.user_revoked' : 'auth.user_restored',
@@ -2141,7 +2186,7 @@ app.get('/api/audit-logs', requireAdmin, (req: AuthenticatedRequest, res) => {
   const filtered = rows
     .filter(r => !r.tenant_id || canAccessTenant(user, r.tenant_id))
     .map(r => {
-      let metadata: Record<string, unknown> = {};
+      let metadata: Record<string, unknown>;
       try {
         metadata = JSON.parse(r.metadata || '{}');
       } catch {
@@ -2166,7 +2211,21 @@ app.get('/api/audit-logs', requireAdmin, (req: AuthenticatedRequest, res) => {
 // -------------------------------------------------------------
 // 9. Health & Support Endpoints
 // -------------------------------------------------------------
+// Minimal public liveness/readiness check (no infrastructure metadata or DB counts leaked publicly)
 app.get('/api/health', (_req, res) => {
+  try {
+    db.prepare('SELECT 1').get();
+    res.json({
+      status: 'operational',
+      timestamp: Date.now(),
+    });
+  } catch {
+    res.status(500).json({ status: 'degraded', timestamp: Date.now() });
+  }
+});
+
+// Authenticated admin diagnostics endpoint
+app.get('/api/diagnostics', requireAdmin, (_req, res) => {
   try {
     const tenantsCount = (db.prepare('SELECT COUNT(*) as cnt FROM tenants').get() as { cnt: number }).cnt;
     const logsCount = (db.prepare('SELECT COUNT(*) as cnt FROM call_logs').get() as { cnt: number }).cnt;
@@ -2825,9 +2884,9 @@ app.post('/api/benchmark/run', requireAuthenticated, async (_req, res) => {
     const emergency = checkEmergencyCondition(testCase.userInput, lang.detected, targetTenant);
     const wantsHuman = checkHumanEscalationRequest(testCase.userInput);
 
-    let detectedIntent = 'general_inquiry';
+    let detectedIntent: string;
     let toolInvoked: string | undefined = undefined;
-    let actualReply = '';
+    let actualReply: string;
 
     if (emergency) {
       detectedIntent = 'emergency_medical';
@@ -2898,9 +2957,28 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`VaniVoice AI server running on port ${PORT} [${isDev ? 'development' : 'production'}]`);
+  const httpServer = app.listen(PORT, '0.0.0.0', () => {
+    logStructuredEvent('info', 'server.started', {
+      port: PORT,
+      mode: isDev ? 'development' : 'production',
+      geminiConfigured: Boolean(aiClient),
+      dataDir: DATA_DIR,
+    });
   });
+
+  const gracefulShutdown = (signal: string) => {
+    logStructuredEvent('info', 'server.stopping', { signal });
+    httpServer.close(() => {
+      try {
+        db.close();
+      } catch {
+        // ignore if already closed
+      }
+      process.exit(0);
+    });
+  };
+  process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+  process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 }
 
 startServer().catch(err => {

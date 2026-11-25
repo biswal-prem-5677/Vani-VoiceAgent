@@ -32,3 +32,4 @@ This operational runbook guides Forward Deployed Engineers (FDEs) through onboar
    - Confirm appointment booking enforces 2-step confirmation with immutable `actionId` and parameter hash.
    - Verify **Call Transcripts -> FDE Operational Outcomes & Outbound EHR Deliveries** shows `delivered` status (or test 1-click **Retry Delivery** if upstream returns an error).
    - Verify emergency speech immediately queues a high-priority callback ticket and advisories (`112`) without making medical diagnoses.
+   - Run `npm run db:backup` to snapshot `./data/vanivoice.db` cleanly before cutover and verify authenticated runtime telemetry via **System Status** (`/api/diagnostics`).

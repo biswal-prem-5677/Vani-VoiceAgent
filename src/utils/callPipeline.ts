@@ -90,7 +90,7 @@ export function extractEntitiesFromInput(text: string, currentMemory: Record<str
   }
 
   // Patient / Caller Name
-  const nameMatch = text.match(/(?:(?:my\s+)?name\s+is|naam\s+hai|naa\s+moro|moro\s+naa|ମୋ\s+ନାଁ|ମୋ\s+ନାମ|नाम\s+है|নাম\s+হলো|নাম)\s+([A-Za-z\u0B00-\u0B7F\u0900-\u097F\u0980-\u09FF]+)/i);
+  const nameMatch = text.match(/(?:(?:my\s+)?name\s+is|naam\s+hai|naa\s+moro|moro\s+naa|ମୋ\s+ନାଁ|ମୋ\s+ନାମ|नाम\s+है|নাম\s+হলো|নাম)\s+([\p{L}\p{M}]+)/iu);
   if (nameMatch && nameMatch[1]) {
     updated.patientName = nameMatch[1].trim();
   }
@@ -301,7 +301,7 @@ export function processTurn(input: ProcessTurnInput): ProcessTurnOutput {
   const matchedChunk = ragMatches[0];
 
   // 7. Compose Spoken Reply
-  let spokenReply = '';
+  let spokenReply: string;
 
   if (toolResult) {
     spokenReply = toolResult.outputMessage;

@@ -64,7 +64,7 @@ const STOP_WORDS = new Set([
 export function extractTokens(text: string): string[] {
   return text
     .toLowerCase()
-    .replace(/[^\w\s\u0B00-\u0B7F\u0900-\u097F\u0980-\u09FF]/g, ' ')
+    .replace(/[^\w\s\p{L}\p{M}]/gu, ' ')
     .split(/\s+/)
     .map(t => t.trim())
     .filter(t => t.length > 1 && !STOP_WORDS.has(t));

@@ -9,6 +9,7 @@ export interface SessionTokenPayload {
   name: string;
   role: UserRole;
   allowedTenants: string[];
+  ver?: number;
   iat: number;
   exp: number;
 }

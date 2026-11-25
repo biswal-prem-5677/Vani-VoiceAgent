@@ -581,6 +581,86 @@ test('Integration: Outbound webhook dispatch retries failed attempts with HMAC s
       headers: { Authorization: `Bearer ${opAuth.token}` },
     });
     assert.strictEqual(rejectedAfterRevoke.status, 401, 'Revoked user token must fail immediately on next request');
+
+    // 7. Public /api/health must be minimal (no DB counts/nodeVersion), while /api/diagnostics requires admin
+    const pubHealthRes = await fetch(`${baseUrl}/api/health`);
+    assert.strictEqual(pubHealthRes.status, 200);
+    const pubHealth = (await pubHealthRes.json()) as any;
+    assert.strictEqual(pubHealth.status, 'operational');
+    assert.strictEqual(pubHealth.database, undefined);
+    assert.strictEqual(pubHealth.systemMetrics, undefined);
+
+    const cspHeader = pubHealthRes.headers.get('content-security-policy') || '';
+    assert.ok(cspHeader.includes("object-src 'none'"), 'Responses must carry Content-Security-Policy');
+    assert.ok(cspHeader.includes('frame-ancestors'), 'CSP must define frame-ancestors');
+
+    const callerDiagRes = await fetch(`${baseUrl}/api/diagnostics`, { headers: callerHeaders });
+    assert.strictEqual(callerDiagRes.status, 403);
+
+    const adminDiagRes = await fetch(`${baseUrl}/api/diagnostics`, { headers: adminHeaders });
+    assert.strictEqual(adminDiagRes.status, 200);
+    const adminDiag = (await adminDiagRes.json()) as any;
+    assert.strictEqual(adminDiag.database.type, 'sqlite');
+
+    // 8. Non-truncated server-authoritative deletion across > 150 persisted logs
+    const bulkCallerRes = await fetch(`${baseUrl}/api/auth/caller-session`, { method: 'POST' });
+    const bulkCallerAuth = (await bulkCallerRes.json()) as any;
+    const bulkHeaders = {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${bulkCallerAuth.token}`,
+    };
+    const bulkConsentRes = await fetch(`${baseUrl}/api/consent`, {
+      method: 'POST',
+      headers: bulkHeaders,
+      body: JSON.stringify({ consented: true, retentionDays: 30, tenantId: 'kalinga_clinic' }),
+    });
+    assert.strictEqual(bulkConsentRes.status, 200);
+
+    for (let i = 0; i < 155; i++) {
+      const logRes = await fetch(`${baseUrl}/api/logs`, {
+        method: 'POST',
+        headers: bulkHeaders,
+        body: JSON.stringify({
+          id: `call_bulk_${i}`,
+          tenantId: 'kalinga_clinic',
+          tenantName: 'Kalinga Care Multispeciality Clinic',
+          callerNumber: '+91-90000-00000',
+          callerName: `Caller ${i}`,
+          startedAt: new Date(Date.now() - i * 1000).toISOString(),
+          durationSeconds: 12,
+          languagesUsed: ['en'],
+          detectedIntent: 'general_inquiry',
+          turns: [
+            { id: `m_${i}_1`, speaker: 'user', text: 'OPD check', timestamp: Date.now() },
+            { id: `m_${i}_2`, speaker: 'agent', text: 'Confirmed.', timestamp: Date.now() },
+          ],
+          metrics: {
+            averageLatencyMs: 120,
+            p95LatencyMs: 180,
+            bargeInCount: 0,
+            toolsExecutedCount: 0,
+            taskCompleted: true,
+            handedOffToHuman: false,
+            satisfactionScore: 5,
+          },
+        }),
+      });
+      assert.strictEqual(logRes.status, 201);
+    }
+
+    const bulkSessionLogsBefore = (await (await fetch(`${baseUrl}/api/session/logs`, { headers: bulkHeaders })).json()) as any[];
+    assert.strictEqual(bulkSessionLogsBefore.length, 155);
+
+    const bulkDeleteRes = await fetch(`${baseUrl}/api/session/data`, {
+      method: 'DELETE',
+      headers: bulkHeaders,
+    });
+    assert.strictEqual(bulkDeleteRes.status, 200);
+    const bulkDeleteJson = (await bulkDeleteRes.json()) as any;
+    assert.strictEqual(bulkDeleteJson.deleted.callLogs, 155, 'All 155 logs must be deleted atomically without truncation');
+
+    const bulkSessionLogsAfter = (await (await fetch(`${baseUrl}/api/session/logs`, { headers: bulkHeaders })).json()) as any[];
+    assert.strictEqual(bulkSessionLogsAfter.length, 0);
   } finally {
     webhookServer.close();
     proc.kill('SIGTERM');

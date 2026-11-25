@@ -12,11 +12,15 @@ const blueprint = JSON.parse(fs.readFileSync(BLUEPRINT_PATH, 'utf8')) as {
   firestore: Record<string, { schema?: { $ref?: string }; description?: string }>;
 };
 
-test('Firestore Rules: Enforces global default-deny and verified identity invariants', () => {
+test('Firestore Rules: Enforces global default-deny, zero hardcoded emails, and verified identity', () => {
   assert.ok(rulesText.includes("rules_version = '2';"), 'Rules version must be v2');
   assert.ok(
     /match \/\{document=\*\*\} \{\s*allow read, write: if false;/.test(rulesText),
     'Global default-deny net must exist'
+  );
+  assert.ok(
+    !rulesText.includes('@gmail.com') && !rulesText.includes('priyabratabiswal'),
+    'Security rules must NEVER hardcode personal email addresses'
   );
   assert.ok(
     rulesText.includes('request.auth.token.email_verified == true'),
@@ -29,9 +33,13 @@ test('Firestore Rules: Enforces global default-deny and verified identity invari
   );
 });
 
-test('Firestore Rules: Every blueprint collection is governed by strict rules and schema validators', () => {
+test('Firestore Rules: Blueprint collections are strictly governed and operational PII stays off client Firestore', () => {
   const blueprintPaths = Object.keys(blueprint.firestore);
-  assert.strictEqual(blueprintPaths.length, 9, 'Expected 9 collections in firebase-blueprint.json');
+  assert.deepStrictEqual(
+    blueprintPaths.sort(),
+    ['/admins/{uid}', '/tenants/{tenantId}', '/users/{uid}'],
+    'Firestore blueprint must only store identity/RBAC/tenant metadata; operational PII stays in SQLite'
+  );
 
   for (const collectionPath of blueprintPaths) {
     assert.ok(
@@ -39,31 +47,59 @@ test('Firestore Rules: Every blueprint collection is governed by strict rules an
       `Missing match block in firestore.rules for blueprint collection ${collectionPath}`
     );
   }
+
+  for (const forbidden of ['/callSessions/', '/handoffs/', '/appointments/', '/integrations/']) {
+    assert.ok(
+      !rulesText.includes(forbidden),
+      `Operational PII collection ${forbidden} must not be exposed to client Firestore rules`
+    );
+  }
 });
 
-test('Firestore Rules: Dirty Dozen adversarial protections exist', () => {
-  // No self-elevation to super_admin on user create
+test('Firestore Rules: Strict Super-Admin vs Tenant-Admin RBAC separation & tenant isolation', () => {
+  // Admins collection must NOT allow any generic isAdmin() write; only isSuperAdmin() can elevate/manage admins
+  assert.ok(rulesText.includes('function isSuperAdmin()'), 'Must distinguish super_admin from tenant_admin');
+  assert.ok(
+    rulesText.includes('function hasTenantAccess(tenantId)') &&
+      rulesText.includes('tenantId in adminData().allowedTenants'),
+    'Must enforce tenant_admin access strictly via allowedTenants list'
+  );
+
+  assert.ok(
+    /match \/admins\/\{uid\}[\s\S]*?allow create: if isValidId\(uid\) && isSuperAdmin\(\)/.test(rulesText),
+    'Only super_admin may create or elevate /admins entries'
+  );
+  assert.ok(
+    /match \/admins\/\{uid\}[\s\S]*?allow update: if isValidId\(uid\) && isSuperAdmin\(\)/.test(rulesText),
+    'Only super_admin may update /admins entries'
+  );
+
+  // Tenants must NOT allow open get/list to any verified user
+  assert.ok(
+    !/match \/tenants\/\{tenantId\}[\s\S]*?allow get:\s*if isValidId\(tenantId\) && isVerifiedUser\(\)/.test(rulesText),
+    'Verified callers must NEVER be able to arbitrarily get tenant documents'
+  );
+  assert.ok(
+    !/match \/tenants\/\{tenantId\}[\s\S]*?allow list:\s*if isVerifiedUser\(\);/.test(rulesText),
+    'Verified callers must NEVER be able to list all tenants'
+  );
+  assert.ok(
+    /match \/tenants\/\{tenantId\}[\s\S]*?allow get: if isValidId\(tenantId\) && hasTenantAccess\(tenantId\)/.test(
+      rulesText
+    ),
+    'Tenant get must be restricted to hasTenantAccess(tenantId)'
+  );
+  assert.ok(
+    /match \/tenants\/\{tenantId\}[\s\S]*?resource\.data\.memberUids\[request\.auth\.uid\] == true/.test(rulesText),
+    'Tenant list must be scoped to memberUids map membership or super_admin'
+  );
+
+  // User self-signup locked to caller + non-revoked
   assert.ok(
     rulesText.includes("incoming().role == 'caller' && incoming().revoked == false"),
     'User self-create must restrict role to caller and revoked to false'
   );
-
-  // Strict schema checks (hasAll / hasOnly) preventing ghost fields
   assert.ok(rulesText.includes('.keys().hasAll('), 'Schema must enforce required keys');
   assert.ok(rulesText.includes('.keys().hasOnly('), 'Schema must enforce exact field allowlist');
-
-  // Server request.time & immutable createdAt/ownerUid checks
-  assert.ok(rulesText.includes('incoming().createdAt == request.time'), 'Must enforce server request.time on create');
-  assert.ok(rulesText.includes('incoming().createdAt == existing().createdAt'), 'Must lock createdAt immutability');
   assert.ok(rulesText.includes('incoming().ownerUid == existing().ownerUid'), 'Must lock ownerUid immutability');
-
-  // Terminal state locking
-  assert.ok(rulesText.includes("existing().status != 'resolved'"), 'Handoff updates must block resolved tickets');
-  assert.ok(rulesText.includes("existing().status != 'cancelled'"), 'Appointment updates must block cancelled slots');
-
-  // Append-only audit logs
-  assert.ok(
-    /match \/auditLogs\/\{logId\}[\s\S]*?allow update, delete: if false;/.test(rulesText),
-    'Audit logs must be immutable append-only'
-  );
 });

@@ -123,18 +123,15 @@ export const SupportDeskModal: React.FC<SupportDeskModalProps> = ({
             </div>
           ) : (
             <form onSubmit={handleSubmit} className="space-y-3.5 text-xs">
-              {/* Direct email info */}
+              {/* Support queue info */}
               <div className="flex items-center justify-between p-3 rounded-xl bg-white/[0.03] border border-white/5 text-[11px]">
                 <div className="flex items-center gap-2 text-slate-300">
                   <Mail className="w-4 h-4 text-indigo-400" />
-                  <span>Direct Desk Email:</span>
+                  <span>Workspace Support Queue:</span>
                 </div>
-                <a
-                  href="mailto:priyabratabiswal567@gmail.com"
-                  className="font-mono text-indigo-400 hover:text-indigo-300 underline"
-                >
-                  priyabratabiswal567@gmail.com
-                </a>
+                <span className="font-mono text-indigo-300">
+                  Server Ticketing (90d auto-expiry)
+                </span>
               </div>
 
               {errorMsg && (

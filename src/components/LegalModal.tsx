@@ -167,9 +167,9 @@ export const LegalModal: React.FC<LegalModalProps> = ({
                 </p>
               </div>
               <div className="p-3 rounded-xl bg-white/[0.03] border border-white/5 space-y-2">
-                <h4 className="font-semibold text-white">3. Tenant Isolation & Authorization</h4>
+                <h4 className="font-semibold text-white">3. Single Authoritative Persistence & Tenant Isolation</h4>
                 <p>
-                  Administrative transcript views, handoff queues, clinic appointments, audit logs, knowledge base editing, and workspace wipes require authenticated server-signed tokens scoped to authorized tenant IDs.
+                  All operational records (consented call logs, handoff queues, appointments, webhook deliveries, support tickets, and audit logs) are stored exclusively on the authoritative server-side SQLite database—never replicated to untrusted browser caches. Firebase Auth OIDC provides verified administrator sign-in; administrative routes require server-signed tokens scoped to authorized tenant IDs.
                 </p>
               </div>
             </div>
@@ -177,18 +177,18 @@ export const LegalModal: React.FC<LegalModalProps> = ({
 
           {activeSubTab === 'terms' && (
             <div className="space-y-3">
-              <h3 className="text-sm font-bold text-white">Terms of Service & End User License Agreement (EULA)</h3>
-              <div className="p-3 rounded-xl bg-rose-500/10 border border-rose-500/20 text-rose-200">
+              <h3 className="text-sm font-bold text-white">Terms of Service, EULA & Healthcare Boundary</h3>
+              <div className="p-3 rounded-xl bg-rose-500/10 border border-rose-500/20 text-rose-200 space-y-1.5">
                 <h4 className="font-semibold flex items-center gap-1.5 text-rose-300">
                   <AlertTriangle className="w-4 h-4" />
-                  Critical Healthcare & Prototype Disclaimer
+                  Critical Healthcare & Non-HIPAA Regulatory Boundary
                 </h4>
-                <p className="mt-1 text-[11px]">
-                  VaniVoice AI is an automated software prototype. It cannot triage emergencies, bridge live emergency telephone lines, or provide medical diagnoses. In acute emergencies, immediately dial <strong>112</strong>.
+                <p className="text-[11px]">
+                  VaniVoice AI is an automated software prototype and <strong>not</strong> a certified medical device (CDSCO/FDA) or a HIPAA-covered Electronic Health Record system. Do not submit protected health insurance claims, regulated clinical notes, or life-threatening emergencies here. In acute emergencies, immediately dial <strong>112</strong>.
                 </p>
               </div>
               <p>
-                <strong>Prototype Data Fixtures:</strong> Built-in tool integrations (clinic appointment booking, parcel tracking, batch schedules, rank cutoffs) operate on sample demonstration records rather than live external EHR or courier carrier systems.
+                <strong>Clinic Pilot Scope:</strong> Built-in OPD timing and slot-booking flows handle front-desk scheduling logistics only, emit HMAC-SHA256 webhooks when configured by clinic admins, and enforce strict pre-confirmation before committing slots.
               </p>
             </div>
           )}

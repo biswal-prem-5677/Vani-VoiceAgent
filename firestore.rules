@@ -1,13 +1,13 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    // Global default-deny safety net
+    // Global default-deny net: operational/PII records reside strictly in server-side SQLite
     match /{document=**} {
       allow read, write: if false;
     }
 
     // ---------------------------------------------------------
-    // Global Hardened Primitives
+    // Global Hardened Primitives (Zero Hardcoded Emails)
     // ---------------------------------------------------------
     function incoming() {
       return request.resource.data;
@@ -33,10 +33,25 @@ service cloud.firestore {
       return isVerifiedUser() && request.auth.uid == uid;
     }
 
-    function isAdmin() {
-      return isVerifiedUser() && (
-        request.auth.token.email == 'priyabratabiswal567@gmail.com' ||
-        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+    function adminExists() {
+      return exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+    }
+
+    function adminData() {
+      return get(/databases/$(database)/documents/admins/$(request.auth.uid)).data;
+    }
+
+    function isSuperAdmin() {
+      return isVerifiedUser() && adminExists() && adminData().role == 'super_admin';
+    }
+
+    function hasTenantAccess(tenantId) {
+      return isSuperAdmin() || (
+        isVerifiedUser() &&
+        adminExists() &&
+        adminData().role == 'tenant_admin' &&
+        adminData().allowedTenants is list &&
+        tenantId in adminData().allowedTenants
       );
     }
 
@@ -44,11 +59,12 @@ service cloud.firestore {
     // Validation Blueprints
     // ---------------------------------------------------------
     function isValidAdminEntry(data, uid) {
-      return data.keys().hasAll(['uid', 'email', 'role', 'createdAt']) &&
-        data.keys().hasOnly(['uid', 'email', 'role', 'createdAt']) &&
+      return data.keys().hasAll(['uid', 'email', 'role', 'allowedTenants', 'createdAt']) &&
+        data.keys().hasOnly(['uid', 'email', 'role', 'allowedTenants', 'createdAt']) &&
         data.uid is string && data.uid == uid && isValidId(data.uid) &&
         data.email is string && data.email.size() >= 3 && data.email.size() <= 160 &&
         data.role in ['super_admin', 'tenant_admin'] &&
+        data.allowedTenants is list && data.allowedTenants.size() <= 50 &&
         data.createdAt is timestamp;
     }
 
@@ -65,103 +81,16 @@ service cloud.firestore {
     }
 
     function isValidTenantWorkspace(data, tenantId) {
-      return data.keys().hasAll(['id', 'name', 'category', 'agentName', 'ownerUid', 'updatedAt']) &&
-        data.keys().hasOnly(['id', 'name', 'category', 'agentName', 'webhookEnabled', 'ownerUid', 'updatedAt']) &&
+      return data.keys().hasAll(['id', 'name', 'category', 'agentName', 'ownerUid', 'memberUids', 'updatedAt']) &&
+        data.keys().hasOnly(['id', 'name', 'category', 'agentName', 'webhookEnabled', 'ownerUid', 'memberUids', 'updatedAt']) &&
         data.id is string && data.id == tenantId && isValidId(data.id) && data.id.size() >= 2 && data.id.size() <= 80 &&
         data.name is string && data.name.size() >= 2 && data.name.size() <= 120 &&
         data.category in ['clinic', 'coaching', 'logistics', 'university', 'custom'] &&
         data.agentName is string && data.agentName.size() >= 1 && data.agentName.size() <= 60 &&
         (!('webhookEnabled' in data) || data.webhookEnabled is bool) &&
         data.ownerUid is string && isValidId(data.ownerUid) &&
+        data.memberUids is map && data.memberUids.size() <= 50 &&
         data.updatedAt is timestamp;
-    }
-
-    function isValidCallSession(data, sessionId) {
-      return data.keys().hasAll([
-          'id', 'ownerUid', 'tenantId', 'tenantName', 'detectedIntent',
-          'durationSeconds', 'taskCompleted', 'handedOffToHuman', 'retentionDays', 'createdAt'
-        ]) &&
-        data.keys().hasOnly([
-          'id', 'ownerUid', 'tenantId', 'tenantName', 'detectedIntent',
-          'durationSeconds', 'averageLatencyMs', 'p95LatencyMs',
-          'taskCompleted', 'handedOffToHuman', 'retentionDays', 'createdAt'
-        ]) &&
-        data.id is string && data.id == sessionId && isValidId(data.id) && data.id.size() >= 3 && data.id.size() <= 100 &&
-        data.ownerUid is string && isValidId(data.ownerUid) &&
-        data.tenantId is string && isValidId(data.tenantId) && data.tenantId.size() <= 80 &&
-        data.tenantName is string && data.tenantName.size() >= 1 && data.tenantName.size() <= 120 &&
-        data.detectedIntent is string && data.detectedIntent.size() >= 1 && data.detectedIntent.size() <= 80 &&
-        data.durationSeconds is number && data.durationSeconds >= 0 && data.durationSeconds <= 86400 &&
-        (!('averageLatencyMs' in data) || (data.averageLatencyMs is number && data.averageLatencyMs >= 0 && data.averageLatencyMs <= 120000)) &&
-        (!('p95LatencyMs' in data) || (data.p95LatencyMs is number && data.p95LatencyMs >= 0 && data.p95LatencyMs <= 120000)) &&
-        data.taskCompleted is bool &&
-        data.handedOffToHuman is bool &&
-        data.retentionDays is number && data.retentionDays in [7, 30, 90] &&
-        data.createdAt is timestamp;
-    }
-
-    function isValidHandoffTicket(data, ticketId) {
-      return data.keys().hasAll(['id', 'ownerUid', 'tenantId', 'reason', 'priority', 'summary', 'status', 'createdAt', 'updatedAt']) &&
-        data.keys().hasOnly(['id', 'ownerUid', 'tenantId', 'reason', 'priority', 'summary', 'status', 'createdAt', 'updatedAt']) &&
-        data.id is string && data.id == ticketId && isValidId(data.id) && data.id.size() >= 3 && data.id.size() <= 100 &&
-        data.ownerUid is string && isValidId(data.ownerUid) &&
-        data.tenantId is string && isValidId(data.tenantId) && data.tenantId.size() <= 80 &&
-        data.reason is string && data.reason.size() >= 1 && data.reason.size() <= 300 &&
-        data.priority in ['critical', 'high', 'normal'] &&
-        data.summary is string && data.summary.size() >= 1 && data.summary.size() <= 1000 &&
-        data.status in ['queued', 'acknowledged', 'resolved'] &&
-        data.createdAt is timestamp &&
-        data.updatedAt is timestamp;
-    }
-
-    function isValidAppointment(data, appointmentId) {
-      return data.keys().hasAll(['id', 'ownerUid', 'tenantId', 'doctor', 'slot', 'patientName', 'status', 'actionId', 'createdAt']) &&
-        data.keys().hasOnly(['id', 'ownerUid', 'tenantId', 'doctor', 'slot', 'patientName', 'status', 'actionId', 'createdAt']) &&
-        data.id is string && data.id == appointmentId && isValidId(data.id) && data.id.size() >= 3 && data.id.size() <= 100 &&
-        data.ownerUid is string && isValidId(data.ownerUid) &&
-        data.tenantId is string && isValidId(data.tenantId) && data.tenantId.size() <= 80 &&
-        data.doctor is string && data.doctor.size() >= 1 && data.doctor.size() <= 120 &&
-        data.slot is string && data.slot.size() >= 1 && data.slot.size() <= 80 &&
-        data.patientName is string && data.patientName.size() >= 1 && data.patientName.size() <= 120 &&
-        data.status in ['confirmed', 'cancelled'] &&
-        data.actionId is string && isValidId(data.actionId) && data.actionId.size() >= 3 && data.actionId.size() <= 100 &&
-        data.createdAt is timestamp;
-    }
-
-    function isValidIntegrationDelivery(data, deliveryId) {
-      return data.keys().hasAll(['id', 'ownerUid', 'tenantId', 'eventType', 'status', 'attemptCount', 'idempotencyKey', 'createdAt', 'updatedAt']) &&
-        data.keys().hasOnly(['id', 'ownerUid', 'tenantId', 'eventType', 'status', 'attemptCount', 'idempotencyKey', 'createdAt', 'updatedAt']) &&
-        data.id is string && data.id == deliveryId && isValidId(data.id) && data.id.size() >= 3 && data.id.size() <= 100 &&
-        data.ownerUid is string && isValidId(data.ownerUid) &&
-        data.tenantId is string && isValidId(data.tenantId) && data.tenantId.size() <= 80 &&
-        data.eventType is string && data.eventType.size() >= 1 && data.eventType.size() <= 80 &&
-        data.status in ['pending', 'delivered', 'failed', 'not_configured'] &&
-        data.attemptCount is number && data.attemptCount >= 0 && data.attemptCount <= 10 &&
-        data.idempotencyKey is string && data.idempotencyKey.size() >= 3 && data.idempotencyKey.size() <= 120 &&
-        data.createdAt is timestamp &&
-        data.updatedAt is timestamp;
-    }
-
-    function isValidAuditEvent(data, logId) {
-      return data.keys().hasAll(['id', 'traceId', 'actorUid', 'action', 'createdAt']) &&
-        data.keys().hasOnly(['id', 'traceId', 'actorUid', 'action', 'tenantId', 'createdAt']) &&
-        data.id is string && data.id == logId && isValidId(data.id) && data.id.size() >= 3 && data.id.size() <= 100 &&
-        data.traceId is string && data.traceId.size() >= 1 && data.traceId.size() <= 80 &&
-        data.actorUid is string && isValidId(data.actorUid) &&
-        data.action is string && data.action.size() >= 1 && data.action.size() <= 100 &&
-        (!('tenantId' in data) || (data.tenantId is string && data.tenantId.size() <= 80)) &&
-        data.createdAt is timestamp;
-    }
-
-    function isValidSupportTicket(data, ticketId) {
-      return data.keys().hasAll(['id', 'ownerUid', 'name', 'subject', 'message', 'createdAt']) &&
-        data.keys().hasOnly(['id', 'ownerUid', 'name', 'subject', 'message', 'createdAt']) &&
-        data.id is string && data.id == ticketId && isValidId(data.id) && data.id.size() >= 3 && data.id.size() <= 100 &&
-        data.ownerUid is string && isValidId(data.ownerUid) &&
-        data.name is string && data.name.size() >= 1 && data.name.size() <= 120 &&
-        data.subject is string && data.subject.size() >= 1 && data.subject.size() <= 180 &&
-        data.message is string && data.message.size() >= 1 && data.message.size() <= 3000 &&
-        data.createdAt is timestamp;
     }
 
     // ---------------------------------------------------------
@@ -174,24 +103,26 @@ service cloud.firestore {
       allow list, write: if false;
     }
 
+    // Strictly super-admin managed RBAC directory (tenant_admins cannot list, create, elevate, or delete)
     match /admins/{uid} {
-      allow get: if isValidId(uid) && (isOwner(uid) || isAdmin());
-      allow list: if isAdmin();
-      allow create: if isValidId(uid) && isAdmin() && isValidAdminEntry(incoming(), uid) && incoming().createdAt == request.time;
-      allow update: if isValidId(uid) && isAdmin() && isValidAdminEntry(incoming(), uid) && incoming().createdAt == existing().createdAt;
-      allow delete: if isValidId(uid) && isAdmin();
+      allow get: if isValidId(uid) && (isOwner(uid) || isSuperAdmin());
+      allow list: if isSuperAdmin();
+      allow create: if isValidId(uid) && isSuperAdmin() && isValidAdminEntry(incoming(), uid) && incoming().createdAt == request.time;
+      allow update: if isValidId(uid) && isSuperAdmin() && isValidAdminEntry(incoming(), uid) && incoming().createdAt == existing().createdAt;
+      allow delete: if isValidId(uid) && isSuperAdmin();
     }
 
+    // OIDC User profiles (self-signup locked to least-privilege 'caller' + revoked: false)
     match /users/{uid} {
-      allow get: if isValidId(uid) && (isOwner(uid) || isAdmin());
-      allow list: if isAdmin();
+      allow get: if isValidId(uid) && (isOwner(uid) || isSuperAdmin());
+      allow list: if isSuperAdmin();
       allow create: if isValidId(uid) &&
         isValidUserProfile(incoming(), uid) &&
         incoming().createdAt == request.time &&
         incoming().updatedAt == request.time &&
         (
           (isOwner(uid) && incoming().role == 'caller' && incoming().revoked == false) ||
-          isAdmin()
+          isSuperAdmin()
         );
       allow update: if isValidId(uid) &&
         isValidUserProfile(incoming(), uid) &&
@@ -199,124 +130,30 @@ service cloud.firestore {
         incoming().createdAt == existing().createdAt &&
         incoming().updatedAt == request.time &&
         (
-          isAdmin() ||
+          isSuperAdmin() ||
           (isOwner(uid) && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'updatedAt']))
         );
-      allow delete: if isValidId(uid) && (isOwner(uid) || isAdmin());
+      allow delete: if isValidId(uid) && (isOwner(uid) || isSuperAdmin());
     }
 
+    // Strictly tenant-scoped workspace metadata (no cross-tenant get/list by verified callers)
     match /tenants/{tenantId} {
-      allow get: if isValidId(tenantId) && isVerifiedUser();
-      allow list: if isVerifiedUser();
-      allow create: if isValidId(tenantId) && isAdmin() && isValidTenantWorkspace(incoming(), tenantId) && incoming().updatedAt == request.time;
-      allow update: if isValidId(tenantId) && isAdmin() && isValidTenantWorkspace(incoming(), tenantId) && incoming().ownerUid == existing().ownerUid && incoming().updatedAt == request.time;
-      allow delete: if isValidId(tenantId) && isAdmin();
-    }
-
-    match /callSessions/{sessionId} {
-      allow get: if isValidId(sessionId) && isVerifiedUser() && (existing().ownerUid == request.auth.uid || isAdmin());
-      allow list: if isVerifiedUser() && (resource.data.ownerUid == request.auth.uid || isAdmin());
-      allow create: if isValidId(sessionId) &&
+      allow get: if isValidId(tenantId) && hasTenantAccess(tenantId);
+      allow list: if isSuperAdmin() || (
         isVerifiedUser() &&
-        isValidCallSession(incoming(), sessionId) &&
-        incoming().ownerUid == request.auth.uid &&
-        incoming().createdAt == request.time;
-      allow update: if false;
-      allow delete: if isValidId(sessionId) && isVerifiedUser() && (existing().ownerUid == request.auth.uid || isAdmin());
-    }
-
-    match /handoffs/{ticketId} {
-      allow get: if isValidId(ticketId) && isVerifiedUser() && (existing().ownerUid == request.auth.uid || isAdmin());
-      allow list: if isVerifiedUser() && (resource.data.ownerUid == request.auth.uid || isAdmin());
-      allow create: if isValidId(ticketId) &&
-        isVerifiedUser() &&
-        isValidHandoffTicket(incoming(), ticketId) &&
-        incoming().ownerUid == request.auth.uid &&
-        incoming().status == 'queued' &&
-        incoming().createdAt == request.time &&
-        incoming().updatedAt == request.time;
-      allow update: if isValidId(ticketId) &&
-        isVerifiedUser() &&
-        isValidHandoffTicket(incoming(), ticketId) &&
+        resource.data.memberUids is map &&
+        resource.data.memberUids[request.auth.uid] == true
+      );
+      allow create: if isValidId(tenantId) && isSuperAdmin() && isValidTenantWorkspace(incoming(), tenantId) && incoming().updatedAt == request.time;
+      allow update: if isValidId(tenantId) &&
+        isValidTenantWorkspace(incoming(), tenantId) &&
         incoming().ownerUid == existing().ownerUid &&
-        incoming().createdAt == existing().createdAt &&
         incoming().updatedAt == request.time &&
         (
-          isAdmin() ||
-          (
-            existing().ownerUid == request.auth.uid &&
-            existing().status != 'resolved' &&
-            incoming().diff(existing()).affectedKeys().hasOnly(['summary', 'updatedAt'])
-          )
+          isSuperAdmin() ||
+          (hasTenantAccess(tenantId) && incoming().memberUids == existing().memberUids)
         );
-      allow delete: if isValidId(ticketId) && isVerifiedUser() && (existing().ownerUid == request.auth.uid || isAdmin());
-    }
-
-    match /appointments/{appointmentId} {
-      allow get: if isValidId(appointmentId) && isVerifiedUser() && (existing().ownerUid == request.auth.uid || isAdmin());
-      allow list: if isVerifiedUser() && (resource.data.ownerUid == request.auth.uid || isAdmin());
-      allow create: if isValidId(appointmentId) &&
-        isVerifiedUser() &&
-        isValidAppointment(incoming(), appointmentId) &&
-        incoming().ownerUid == request.auth.uid &&
-        incoming().status == 'confirmed' &&
-        incoming().createdAt == request.time;
-      allow update: if isValidId(appointmentId) &&
-        isVerifiedUser() &&
-        isValidAppointment(incoming(), appointmentId) &&
-        incoming().ownerUid == existing().ownerUid &&
-        incoming().createdAt == existing().createdAt &&
-        (
-          isAdmin() ||
-          (
-            existing().ownerUid == request.auth.uid &&
-            existing().status != 'cancelled' &&
-            incoming().status == 'cancelled' &&
-            incoming().diff(existing()).affectedKeys().hasOnly(['status'])
-          )
-        );
-      allow delete: if isValidId(appointmentId) && isVerifiedUser() && (existing().ownerUid == request.auth.uid || isAdmin());
-    }
-
-    match /integrations/{deliveryId} {
-      allow get: if isValidId(deliveryId) && isVerifiedUser() && (existing().ownerUid == request.auth.uid || isAdmin());
-      allow list: if isVerifiedUser() && (resource.data.ownerUid == request.auth.uid || isAdmin());
-      allow create: if isValidId(deliveryId) &&
-        isVerifiedUser() &&
-        isValidIntegrationDelivery(incoming(), deliveryId) &&
-        incoming().ownerUid == request.auth.uid &&
-        incoming().createdAt == request.time &&
-        incoming().updatedAt == request.time;
-      allow update: if isValidId(deliveryId) &&
-        isAdmin() &&
-        isValidIntegrationDelivery(incoming(), deliveryId) &&
-        incoming().ownerUid == existing().ownerUid &&
-        incoming().createdAt == existing().createdAt &&
-        incoming().updatedAt == request.time;
-      allow delete: if isValidId(deliveryId) && isVerifiedUser() && (existing().ownerUid == request.auth.uid || isAdmin());
-    }
-
-    match /auditLogs/{logId} {
-      allow get: if isValidId(logId) && isAdmin();
-      allow list: if isAdmin();
-      allow create: if isValidId(logId) &&
-        isVerifiedUser() &&
-        isValidAuditEvent(incoming(), logId) &&
-        incoming().actorUid == request.auth.uid &&
-        incoming().createdAt == request.time;
-      allow update, delete: if false;
-    }
-
-    match /supportTickets/{ticketId} {
-      allow get: if isValidId(ticketId) && isVerifiedUser() && (existing().ownerUid == request.auth.uid || isAdmin());
-      allow list: if isVerifiedUser() && (resource.data.ownerUid == request.auth.uid || isAdmin());
-      allow create: if isValidId(ticketId) &&
-        isVerifiedUser() &&
-        isValidSupportTicket(incoming(), ticketId) &&
-        incoming().ownerUid == request.auth.uid &&
-        incoming().createdAt == request.time;
-      allow update: if false;
-      allow delete: if isValidId(ticketId) && isVerifiedUser() && (existing().ownerUid == request.auth.uid || isAdmin());
+      allow delete: if isValidId(tenantId) && isSuperAdmin();
     }
   }
 }

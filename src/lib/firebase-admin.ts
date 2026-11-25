@@ -36,7 +36,8 @@ export async function verifyFirebaseIdToken(
 
   try {
     const auth = getAuth(getAdminApp());
-    const decoded = await auth.verifyIdToken(idToken);
+    const checkRevoked = process.env.FIREBASE_CHECK_REVOKED === 'true';
+    const decoded = await auth.verifyIdToken(idToken, checkRevoked);
     if (!decoded?.uid || !decoded.email) return null;
     if (decoded.email_verified !== true) return null;
 
