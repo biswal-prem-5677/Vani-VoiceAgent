@@ -78,19 +78,30 @@ const ADMIN_BOOTSTRAP_TOKEN = process.env.ADMIN_BOOTSTRAP_TOKEN?.trim() || '';
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL?.trim().toLowerCase() || '';
 const ALLOW_LOCAL_WEBHOOKS = process.env.ALLOW_LOCAL_WEBHOOKS === 'true';
 const WEBHOOK_SIGNING_SECRET = process.env.WEBHOOK_SIGNING_SECRET?.trim() || '';
-const CSP_FRAME_ANCESTORS =
-  process.env.CSP_FRAME_ANCESTORS?.trim() ||
-  "'self' https://aistudio.google.com https://*.google.com";
+const DEFAULT_FRAME_ANCESTORS = "'self' https://aistudio.google.com https://*.google.com";
+function sanitizeFrameAncestors(raw: string | undefined): string {
+  const trimmed = raw?.trim();
+  if (!trimmed) return DEFAULT_FRAME_ANCESTORS;
+  const tokens = trimmed.split(/\s+/).filter(Boolean);
+  const validSourceRe = /^(?:'self'|'none'|https?:\/\/[a-zA-Z0-9*.-]+(?::\d+)?|\*\.[a-zA-Z0-9.-]+)$/;
+  const validTokens = tokens.filter((t) => validSourceRe.test(t));
+  return validTokens.length > 0 && validTokens.length === tokens.length
+    ? validTokens.join(' ')
+    : DEFAULT_FRAME_ANCESTORS;
+}
+const CSP_FRAME_ANCESTORS = sanitizeFrameAncestors(process.env.CSP_FRAME_ANCESTORS);
 
 const CONTENT_SECURITY_POLICY = [
   "default-src 'self'",
   isDev
     ? "script-src 'self' 'unsafe-inline' https://apis.google.com https://www.gstatic.com"
     : "script-src 'self' https://apis.google.com https://www.gstatic.com",
-  "style-src 'self' 'unsafe-inline'",
+  "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
   "img-src 'self' data: https:",
-  "font-src 'self' data:",
-  "connect-src 'self' https://*.googleapis.com https://identitytoolkit.googleapis.com https://securetoken.googleapis.com https://*.firebaseio.com https://*.firebaseapp.com wss://*.firebaseio.com",
+  "font-src 'self' data: https://fonts.gstatic.com",
+  isDev
+    ? "connect-src 'self' ws://localhost:* http://localhost:* https://*.googleapis.com https://identitytoolkit.googleapis.com https://securetoken.googleapis.com https://*.firebaseio.com https://*.firebaseapp.com wss://*.firebaseio.com"
+    : "connect-src 'self' https://*.googleapis.com https://identitytoolkit.googleapis.com https://securetoken.googleapis.com https://*.firebaseio.com https://*.firebaseapp.com wss://*.firebaseio.com",
   "frame-src 'self' https://accounts.google.com https://*.firebaseapp.com https://*.google.com",
   "object-src 'none'",
   "base-uri 'self'",

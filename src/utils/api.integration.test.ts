@@ -616,7 +616,7 @@ test('Integration: Outbound webhook dispatch retries failed attempts with HMAC s
     });
     assert.strictEqual(bulkConsentRes.status, 200);
 
-    for (let i = 0; i < 155; i++) {
+    for (let i = 0; i < 125; i++) {
       const logRes = await fetch(`${baseUrl}/api/logs`, {
         method: 'POST',
         headers: bulkHeaders,
@@ -649,7 +649,7 @@ test('Integration: Outbound webhook dispatch retries failed attempts with HMAC s
     }
 
     const bulkSessionLogsBefore = (await (await fetch(`${baseUrl}/api/session/logs`, { headers: bulkHeaders })).json()) as any[];
-    assert.strictEqual(bulkSessionLogsBefore.length, 155);
+    assert.strictEqual(bulkSessionLogsBefore.length, 125);
 
     const bulkDeleteRes = await fetch(`${baseUrl}/api/session/data`, {
       method: 'DELETE',
@@ -657,10 +657,36 @@ test('Integration: Outbound webhook dispatch retries failed attempts with HMAC s
     });
     assert.strictEqual(bulkDeleteRes.status, 200);
     const bulkDeleteJson = (await bulkDeleteRes.json()) as any;
-    assert.strictEqual(bulkDeleteJson.deleted.callLogs, 155, 'All 155 logs must be deleted atomically without truncation');
+    assert.strictEqual(bulkDeleteJson.deleted.callLogs, 125, 'All 125 (>100) logs must be deleted atomically without truncation');
 
     const bulkSessionLogsAfter = (await (await fetch(`${baseUrl}/api/session/logs`, { headers: bulkHeaders })).json()) as any[];
     assert.strictEqual(bulkSessionLogsAfter.length, 0);
+
+    // 9. Role-change token_version invalidation: restore operator, login, update role -> prior token fails immediately
+    await fetch(`${baseUrl}/api/auth/users/${createdUser.user.id}/revoke`, {
+      method: 'POST',
+      headers: adminHeaders,
+      body: JSON.stringify({ revoked: false }),
+    });
+    const opLogin2Res = await fetch(`${baseUrl}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'operator@kalinga.org', password: 'OperatorPass123!' }),
+    });
+    assert.strictEqual(opLogin2Res.status, 200);
+    const opAuth2 = (await opLogin2Res.json()) as any;
+
+    const roleUpdateRes = await fetch(`${baseUrl}/api/auth/users/${createdUser.user.id}/role`, {
+      method: 'PATCH',
+      headers: adminHeaders,
+      body: JSON.stringify({ role: 'caller' }),
+    });
+    assert.strictEqual(roleUpdateRes.status, 200);
+
+    const staleRoleTokenRes = await fetch(`${baseUrl}/api/appointments`, {
+      headers: { Authorization: `Bearer ${opAuth2.token}` },
+    });
+    assert.strictEqual(staleRoleTokenRes.status, 401, 'Role update must increment token_version and invalidate prior tokens');
   } finally {
     webhookServer.close();
     proc.kill('SIGTERM');
