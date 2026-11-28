@@ -4,8 +4,6 @@ import {
   Sliders,
   Sparkles,
   Wrench,
-  UserCheck,
-  ShieldAlert,
   Play,
   Save,
   CheckCircle2,
@@ -35,6 +33,12 @@ export const VoiceConfigTab: React.FC<VoiceConfigTabProps> = ({
 
   // Create speech controller once
   const speechCtrl = useMemo(() => createSpeechController(), []);
+
+  useEffect(() => {
+    return () => {
+      speechCtrl.stop();
+    };
+  }, [speechCtrl]);
 
   const handleSave = () => {
     // Preserve any knowledgeBase chunks that might have been updated in KnowledgeBaseTab

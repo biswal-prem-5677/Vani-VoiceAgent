@@ -13,12 +13,12 @@ This operational runbook guides Forward Deployed Engineers (FDEs) through onboar
    - Domain category (`clinic`, `coaching`, `logistics`, `university`, `custom`)
    - Default language (`or`, `hi`, `hinglish`, `bn`, `en`) and voice persona speed/pitch
    - Escalation department desk phone & email (`humanHandoffContact`)
-3. Open **Knowledge Base** and upload or author domain policy chunks (fees, schedules, SOPs, refund policies). Every turn runs grounded BM25/cross-lingual retrieval before Gemini responds.
+3. Open **Knowledge Base** and upload or author domain policy chunks (fees, schedules, SOPs, refund policies). Every turn runs tokenized cross-lingual keyword/synonym/n-gram retrieval (`searchKnowledgeBase`) before Gemini responds.
 
 ## Minutes 15–22: External EHR / Webhook & Calendar Integration
 1. Navigate to **Voice & Tools -> External EHR / Webhook Delivery & Calendar Export**.
-2. Enable outbound webhooks and paste the customer's HTTPS endpoint URL (SSRF validation automatically rejects private RFC-1918, loopback, and metadata IPs).
-3. Enter a customer-specific HMAC-SHA256 signing secret (or use the server `WEBHOOK_SIGNING_SECRET`).
+2. Enable outbound webhooks and paste the customer's HTTPS endpoint URL (SSRF validation automatically rejects private RFC-1918, loopback, CGNAT, cloud metadata IPs, embedded credentials, HTTP redirects, and DNS-rebound private targets).
+3. Enter a customer-specific HMAC-SHA256 signing secret (or configure server `WEBHOOK_SIGNING_SECRET` — webhook dispatch fails explicitly rather than reusing `SESSION_SECRET`).
 4. Customers verify incoming events (`appointment.booked`, `appointment.cancelled`, `handoff.created`) by checking the `t=<timestamp>,v1=<hex>` signature header against `${timestamp}.${rawBody}`.
 5. Confirmed clinic bookings immediately expose a `.ics` calendar export endpoint (`/api/appointments/:id/calendar.ics`) for both the caller and tenant admins.
 

@@ -10,8 +10,13 @@ export const TurnHistoryItemSchema = z.object({
   timestamp: z.number().optional(),
   toolInvoked: z.object({
     toolName: z.string().max(80),
-    params: z.record(z.string(), z.any()).optional(),
-    result: z.any().optional(),
+    params: z.record(z.string().max(64), z.union([z.string().max(240), z.number(), z.boolean(), z.null()])).optional(),
+    result: z.object({
+      success: z.boolean().optional(),
+      requiresConfirmation: z.boolean().optional(),
+      outputMessage: z.string().max(600).optional(),
+      data: z.record(z.string().max(64), z.any()).optional(),
+    }).optional(),
   }).optional(),
 });
 
@@ -112,7 +117,7 @@ export const CallLogCreateSchema = z.object({
   durationSeconds: z.number().min(0).max(86400),
   languagesUsed: z.array(SupportedLanguageSchema).min(1).max(5),
   detectedIntent: z.string().max(80),
-  turns: z.array(z.any()).min(1).max(60),
+  turns: z.array(TurnHistoryItemSchema).min(1).max(60),
   isSampleData: z.boolean().optional(),
   metrics: z.object({
     averageLatencyMs: z.number().min(0).max(120000),
@@ -121,7 +126,7 @@ export const CallLogCreateSchema = z.object({
     toolsExecutedCount: z.number().min(0).max(100),
     taskCompleted: z.boolean(),
     handedOffToHuman: z.boolean(),
-    satisfactionScore: z.number().min(1).max(5),
+    satisfactionScore: z.number().min(1).max(5).optional(),
   }),
   capturedMemory: z.record(z.string().max(64), z.string().max(240)).optional().default({}),
 });
@@ -129,7 +134,7 @@ export const CallLogCreateSchema = z.object({
 export const AuthBootstrapSchema = z.object({
   name: z.string().trim().min(2).max(80),
   email: z.string().trim().email().max(160),
-  password: z.string().min(8, 'Password must be at least 8 characters').max(128),
+  password: z.string().min(12, 'Password must be at least 12 characters').max(128),
   bootstrapToken: z.string().trim().max(256).optional(),
 });
 
@@ -141,7 +146,7 @@ export const AuthLoginSchema = z.object({
 export const TenantAdminCreateSchema = z.object({
   name: z.string().trim().min(2).max(80),
   email: z.string().trim().email().max(160),
-  password: z.string().min(8).max(128),
+  password: z.string().min(12, 'Password must be at least 12 characters').max(128),
   role: z.enum(['tenant_admin', 'super_admin']).default('tenant_admin'),
   allowedTenants: z.array(z.string().trim().min(1).max(80)).min(1).max(20),
 });
@@ -153,6 +158,10 @@ export const HandoffUpdateSchema = z.object({
 
 export const AppointmentUpdateSchema = z.object({
   status: z.enum(['confirmed', 'cancelled']),
+});
+
+export const SupportTicketUpdateSchema = z.object({
+  status: z.enum(['open', 'in_progress', 'resolved']),
 });
 
 export const FirebaseAuthExchangeSchema = z.object({

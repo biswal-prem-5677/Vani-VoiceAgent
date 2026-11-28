@@ -15,11 +15,10 @@ export function computeOperationalMetrics(input: {
 }): OperationalMetricsSummary {
   const { logs, handoffs, appointments, integrations } = input;
   const realLogs = logs.filter(l => !l.isSampleData);
-  const sampleFallback = realLogs.length > 0 ? realLogs : logs;
 
-  const totalSessions = sampleFallback.length;
-  const handedOffSessions = sampleFallback.filter(l => l.metrics?.handedOffToHuman).length;
-  const containedSessions = sampleFallback.filter(
+  const totalSessions = realLogs.length;
+  const handedOffSessions = realLogs.filter(l => l.metrics?.handedOffToHuman).length;
+  const containedSessions = realLogs.filter(
     l => l.metrics?.taskCompleted && !l.metrics?.handedOffToHuman
   ).length;
 
@@ -33,13 +32,21 @@ export function computeOperationalMetrics(input: {
   const bookingCompletionRatePct =
     totalAppointments > 0 ? Math.round((confirmedAppointments / totalAppointments) * 100) : 0;
 
-  const latencies = sampleFallback
-    .map(l => l.metrics?.averageLatencyMs)
-    .filter((ms): ms is number => typeof ms === 'number' && ms > 0);
+  const perTurnLatencies = realLogs.flatMap(log =>
+    (log.turns || [])
+      .map(t => t.latencyMs)
+      .filter((ms): ms is number => typeof ms === 'number' && ms > 0)
+  );
+  const latencies =
+    perTurnLatencies.length > 0
+      ? perTurnLatencies
+      : realLogs
+          .map(l => l.metrics?.averageLatencyMs)
+          .filter((ms): ms is number => typeof ms === 'number' && ms > 0);
   const latencyStats = calculatePercentiles(latencies);
 
   let failedToolCallsCount = 0;
-  for (const log of sampleFallback) {
+  for (const log of realLogs) {
     for (const turn of log.turns || []) {
       if (turn.toolInvoked && turn.toolInvoked.result?.success === false && !turn.toolInvoked.result?.requiresConfirmation) {
         failedToolCallsCount += 1;

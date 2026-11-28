@@ -145,3 +145,68 @@ export function isSlotAlreadyBooked(requestedSlot: string, bookedSlots: string[]
   if (!normalized) return false;
   return bookedSlots.some(s => s.replace(/\s+/g, ' ').trim().toLowerCase() === normalized);
 }
+
+const VALID_CLINIC_SLOT_TIME_RE = /(?:^|\b)(10:00\s*am|10:30\s*am|11:30\s*am|0?4:00\s*pm|0?5:30\s*pm)(?:\b|$)/i;
+const VALID_CLINIC_DAY_PREFIX_RE = /^(?:today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday)\s+/i;
+
+/**
+ * Validates that a requested clinic appointment slot maps to an actual OPD slot
+ * (Monday-Saturday; excludes arbitrary off-hours like 3:17 AM or Sunday OPD).
+ */
+export function isValidClinicSlot(slot: string): { valid: boolean; reason?: string } {
+  const clean = (slot || '').replace(/\s+/g, ' ').trim();
+  if (!clean) {
+    return { valid: false, reason: 'Appointment slot is empty.' };
+  }
+  if (/\bsunday\b/i.test(clean)) {
+    return {
+      valid: false,
+      reason: 'Routine outpatient OPD is closed on Sundays. Please pick Monday through Saturday.',
+    };
+  }
+  const timeMatch = VALID_CLINIC_SLOT_TIME_RE.exec(clean);
+  if (!timeMatch) {
+    return {
+      valid: false,
+      reason: `Slot "${clean}" is outside configured OPD slots (${DEFAULT_CLINIC_SLOTS.join(', ')}).`,
+    };
+  }
+
+  // Ensure any remaining non-time prefix only uses valid days or "Morning"/"Evening"
+  const withoutTime = clean
+    .replace(timeMatch[0], '')
+    .replace(/\b(?:morning|evening|at|on|for)\b/gi, '')
+    .replace(/[()]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (withoutTime && !VALID_CLINIC_DAY_PREFIX_RE.test(withoutTime + ' ')) {
+    return {
+      valid: false,
+      reason: `Unrecognized slot day "${withoutTime}". Choose Today, Tomorrow, or Monday-Saturday.`,
+    };
+  }
+
+  return { valid: true };
+}
+
+const CONFIRM_NEGATION_RE =
+  /\b(?:no|not|don'?t|do\s+not|never|cancel|cancelled|stop|wait|maybe|hold\s+on|nahi|nahin|mat|ruk)\b/i;
+const CONFIRM_INDIC_NEGATION_RE = /(?:ନାହିଁ|ରୋକ|ବାତିଲ|ନहीं|मत|रुक|रद्द|না|থামুন|বাতিল)/;
+const CONFIRM_AFFIRM_RE =
+  /\b(?:yes|confirm|confirmed|proceed|ok|okay|sure|yep|yeah|thik|haan|ha|bilkul|go\s+ahead)\b/i;
+const CONFIRM_INDIC_AFFIRM_RE =
+  /(?:ହଁ|ନିଶ୍ଚୟ|କରନ୍ତୁ|ହଁ\s*ଆଜ୍ଞା|हाँ|बिल्कुल|कर\s*दीजिए|पक्का|হ্যাঁ|নিশ্চয়|করুন)/;
+
+/**
+ * Deterministic confirmation classifier derived strictly from the caller's latest message.
+ * Negations/hedges ("Yes, do not confirm", "maybe", "cancel") always return false.
+ */
+export function evaluateUserConfirmation(userText: string): boolean {
+  const clean = (userText || '').trim();
+  if (!clean) return false;
+  if (CONFIRM_NEGATION_RE.test(clean) || CONFIRM_INDIC_NEGATION_RE.test(clean)) {
+    return false;
+  }
+  return CONFIRM_AFFIRM_RE.test(clean) || CONFIRM_INDIC_AFFIRM_RE.test(clean);
+}

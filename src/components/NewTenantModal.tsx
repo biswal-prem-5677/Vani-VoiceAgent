@@ -18,9 +18,9 @@ export const NewTenantModal: React.FC<NewTenantModalProps> = ({
   const [category, setCategory] = useState<'clinic' | 'coaching' | 'logistics' | 'university' | 'custom'>('custom');
   const [agentName, setAgentName] = useState('Ananya');
   const [defaultLanguage, setDefaultLanguage] = useState<SupportedLanguage>('or');
-  const [primaryColor, setPrimaryColor] = useState('#10B981');
+  const primaryColor = '#10B981';
   const [escalationEmail, setEscalationEmail] = useState('');
-  const [initialDocTitle, setInitialDocTitle] = useState('Business Overview & FAQs');
+  const initialDocTitle = 'Business Overview & FAQs';
   const [initialDocContent, setInitialDocContent] = useState(
     'Our business operates Monday to Saturday 9:00 AM to 6:00 PM. We provide local delivery and instant support in Odia, Hindi, and English.'
   );

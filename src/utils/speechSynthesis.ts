@@ -15,13 +15,22 @@ export interface SpeechController {
 
 export function createSpeechController(): SpeechController {
   let speaking = false;
+  let watchdogTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const clearWatchdog = () => {
+    if (watchdogTimer) {
+      clearTimeout(watchdogTimer);
+      watchdogTimer = null;
+    }
+  };
 
   const stop = () => {
+    clearWatchdog();
     if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
       try {
         window.speechSynthesis.cancel();
-      } catch (e) {
-        // ignore
+      } catch {
+        // ignore cancellation failure
       }
     }
     speaking = false;
@@ -48,13 +57,22 @@ export function createSpeechController(): SpeechController {
 
     const utterance = new SpeechSynthesisUtterance(text);
     speaking = true;
+    let settled = false;
+
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearWatchdog();
+      speaking = false;
+      onEnd?.();
+    };
 
     const baseRate = options?.speed ?? 1.0;
     const basePitch = options?.pitch ?? 1.0;
 
     switch (lang) {
       case 'or':
-        // If native Odia is available in browser OS, use it; otherwise fallback to Indian English/Hindi
+        // If native Odia is available in browser OS, use it; otherwise fallback to Hindi
         utterance.lang = hasOdiaVoiceSupport() ? 'or-IN' : 'hi-IN';
         utterance.rate = baseRate;
         utterance.pitch = basePitch * 1.02;
@@ -95,15 +113,19 @@ export function createSpeechController(): SpeechController {
       utterance.voice = preferredVoice;
     }
 
-    utterance.onend = () => {
-      speaking = false;
-      onEnd?.();
-    };
+    utterance.onend = finish;
+    utterance.onerror = finish;
 
-    utterance.onerror = () => {
-      speaking = false;
-      onEnd?.();
-    };
+    // Chrome/Chromium Web Speech API stall recovery watchdog (approx max utterance budget)
+    const estimatedMs = Math.min(25000, Math.max(8000, Math.round((text.length / Math.max(0.5, baseRate)) * 95)));
+    watchdogTimer = setTimeout(() => {
+      try {
+        window.speechSynthesis.cancel();
+      } catch {
+        // ignore
+      }
+      finish();
+    }, estimatedMs);
 
     window.speechSynthesis.speak(utterance);
   };

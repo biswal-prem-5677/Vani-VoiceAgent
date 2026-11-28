@@ -4,14 +4,9 @@ import {
   MicOff,
   PhoneOff,
   PhoneCall,
-  Volume2,
   Zap,
   Globe2,
-  CheckCircle2,
   AlertTriangle,
-  Database,
-  ArrowRight,
-  Sparkles,
   ShieldAlert,
   Info,
   RotateCcw,
@@ -57,7 +52,6 @@ export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({
   const [isMuted, setIsMuted] = useState<boolean>(false);
   const [orbState, setOrbState] = useState<'idle' | 'listening' | 'processing' | 'speaking' | 'interrupted'>('idle');
   const [activeLanguage, setActiveLanguage] = useState<SupportedLanguage>(tenant.defaultLanguage);
-  const [detectedConfidence, setDetectedConfidence] = useState<number>(1.0);
   const [switchedNotice, setSwitchedNotice] = useState<string | null>(null);
 
   const [turns, setTurns] = useState<CallTurn[]>([]);
@@ -534,7 +528,6 @@ export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({
           toolsExecutedCount: currentTurns.filter(t => t.toolInvoked).length,
           taskCompleted: !handoffReason,
           handedOffToHuman: Boolean(handoffReason),
-          satisfactionScore: handoffReason ? 3 : 5,
         },
         capturedMemory,
       };
@@ -1015,10 +1008,15 @@ export const LiveVoiceCall: React.FC<LiveVoiceCallProps> = ({
         {/* Right Column: Live Transcript, In-Call Working Memory, and Text Input */}
         <div className="lg:col-span-7 bg-[#0D111A] border border-white/[0.08] rounded-2xl p-6 shadow-2xl flex flex-col h-[520px]">
           {/* Transcript Header with Working Memory Badges */}
-          <div className="pb-3 border-b border-white/[0.08] flex items-center justify-between">
+          <div className="pb-3 border-b border-white/[0.08] flex items-center justify-between gap-2 flex-wrap">
             <div className="flex items-center gap-2">
               <span className="w-2 h-2 rounded-full bg-emerald-400" />
               <h3 className="text-sm font-bold text-white">Live Call Transcript</h3>
+              {switchedNotice && (
+                <span className="text-[11px] px-2 py-0.5 rounded bg-indigo-500/15 border border-indigo-500/30 text-indigo-300 font-mono">
+                  {switchedNotice}
+                </span>
+              )}
             </div>
 
             {(queuedHandoffTicket || humanHandoffNotice) && (

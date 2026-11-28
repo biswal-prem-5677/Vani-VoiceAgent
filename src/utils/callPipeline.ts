@@ -7,6 +7,7 @@ import {
   checkHumanEscalationRequest,
   buildHumanEscalationReply,
 } from './safety.ts';
+import { evaluateUserConfirmation } from './actionConfirmation.ts';
 
 export interface ProcessTurnInput {
   userInput: string;
@@ -68,13 +69,16 @@ export function extractEntitiesFromInput(text: string, currentMemory: Record<str
     /ଆଜି/.test(text) ||
     /आज/.test(text);
 
-  const isSaturday = /\b(?:saturday|sanibar)\b/i.test(lower) || /ଶନିବାର/.test(text) || /शनिवार/.test(text);
+  const weekdayMatch = lower.match(/\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|sanibar)\b/i);
 
   if (isTomorrow) {
     updated.day = 'Tomorrow';
   } else if (isToday) {
     updated.day = 'Today';
-  } else if (isSaturday) {
+  } else if (weekdayMatch) {
+    const w = weekdayMatch[1].toLowerCase();
+    updated.day = w === 'sanibar' ? 'Saturday' : w.charAt(0).toUpperCase() + w.slice(1);
+  } else if (/ଶନିବାର/.test(text) || /शनिवार/.test(text)) {
     updated.day = 'Saturday';
   }
 
@@ -175,10 +179,8 @@ export function processTurn(input: ProcessTurnInput): ProcessTurnOutput {
   // 4. Memory & Entity Extraction
   const updatedMemory = extractEntitiesFromInput(userInput, callMemory);
 
-  // Check if caller is confirming a pending action
-  const isConfirmation = /\b(?:yes|confirm|proceed|ok|sure|thik|haan|ha|bilkul)\b/i.test(userInput) ||
-    /ହଁ|ନିଶ୍ଚୟ|କରନ୍ତୁ|ହଁ ଆଜ୍ଞା/.test(userInput) ||
-    /हाँ|बिल्कुल|कर दीजिए|पक्का/.test(userInput);
+  // Check if caller is confirming a pending action (rejects negations and hedging)
+  const isConfirmation = evaluateUserConfirmation(userInput);
 
   // 5. Intent and Tool Execution Check
   const lowerInput = userInput.toLowerCase();
@@ -230,30 +232,32 @@ export function processTurn(input: ProcessTurnInput): ProcessTurnOutput {
     }
   }
 
-  // Logistics Intents (Use whole-word regexes to avoid "border" matching "order")
+  // Logistics Intents (Check reschedule before generic track keywords; use whole-word regexes to avoid "border" matching "order")
   if (tenant.category === 'logistics') {
+    const isRescheduleIntent =
+      /\b(?:reschedule|change\s+date|change\s+time|postpone)\b/i.test(lowerInput) ||
+      /ତାରିଖ|ସମୟ|ପରିବର୍ତ୍ତନ/.test(userInput) ||
+      (callMemory.pendingAction === 'reschedule_delivery' && isConfirmation);
+
     const isTrackIntent =
       /\b(?:track|tracking|shipment|parcel|package|delivery|courier|status)\b/i.test(lowerInput) ||
       (/\border\b/i.test(lowerInput) && !/\bborder\b/i.test(lowerInput)) ||
       /ଅର୍ଡର|ଟ୍ରାକ୍|ଡେଲିଭରି|କୋରିଅର/.test(userInput) ||
       /पार्सल|ट्रैक|डिलीवरी|ऑर्डर/.test(userInput);
 
-    if (isTrackIntent) {
-      detectedIntent = 'track_shipment';
-      toolToInvoke = 'track_shipment';
-      toolParams = { orderId: updatedMemory.orderId };
-      fillerUsed = getNaturalFiller(tenant, activeLang);
-    } else if (
-      /\b(?:reschedule|change\s+date|change\s+time|postpone)\b/i.test(lowerInput) ||
-      /ତାରିଖ|ସମୟ|ପରିବର୍ତ୍ତନ/.test(userInput)
-    ) {
+    if (isRescheduleIntent) {
       detectedIntent = 'reschedule_delivery';
       toolToInvoke = 'reschedule_delivery';
       toolParams = {
         orderId: updatedMemory.orderId,
         newDate: updatedMemory.day || 'Tomorrow',
-        confirmed: isConfirmation,
+        confirmed: isConfirmation && callMemory.pendingAction === 'reschedule_delivery',
       };
+      fillerUsed = getNaturalFiller(tenant, activeLang);
+    } else if (isTrackIntent) {
+      detectedIntent = 'track_shipment';
+      toolToInvoke = 'track_shipment';
+      toolParams = { orderId: updatedMemory.orderId };
       fillerUsed = getNaturalFiller(tenant, activeLang);
     }
   }
@@ -276,7 +280,14 @@ export function processTurn(input: ProcessTurnInput): ProcessTurnOutput {
     ) {
       detectedIntent = 'cutoff_inquiry';
       toolToInvoke = 'check_branch_cutoff';
-      toolParams = { rank: updatedMemory.rank, branch: 'Computer Science' };
+      const detectedBranch = /\b(?:ece|electronics)\b/i.test(lowerInput)
+        ? 'Electronics'
+        : /\b(?:mech|mechanical)\b/i.test(lowerInput)
+        ? 'Mechanical'
+        : /\bcivil\b/i.test(lowerInput)
+        ? 'Civil'
+        : 'Computer Science';
+      toolParams = { rank: updatedMemory.rank, branch: detectedBranch };
       fillerUsed = getNaturalFiller(tenant, activeLang);
     }
   }
@@ -287,8 +298,10 @@ export function processTurn(input: ProcessTurnInput): ProcessTurnOutput {
     if (toolResult.requiresConfirmation) {
       updatedMemory.pendingAction = toolToInvoke;
       updatedMemory.pendingBooking = 'true';
-    } else if (toolResult.success && toolResult.data?.bookingRef) {
-      updatedMemory.bookingRef = toolResult.data.bookingRef;
+    } else if (toolResult.success && (toolResult.data?.bookingRef || toolToInvoke === 'reschedule_delivery')) {
+      if (toolResult.data?.bookingRef) {
+        updatedMemory.bookingRef = toolResult.data.bookingRef;
+      }
       delete updatedMemory.pendingAction;
       delete updatedMemory.pendingBooking;
     }
@@ -309,7 +322,7 @@ export function processTurn(input: ProcessTurnInput): ProcessTurnOutput {
     // Return complete sentence excerpt from relevant knowledge document
     const excerpt = matchedChunk.excerpt || matchedChunk.chunk.content;
     if (activeLang === 'or') {
-      spokenReply = `ଆମ କ୍ଲିନିକ ନିୟମ ଅନୁସାରେ: ${excerpt}। ଆଉ କିଛି ସୂଚନା ଦରକାର କି?`;
+      spokenReply = `ଆମ ନିୟମ ଓ ତଥ୍ୟ ଅନୁସାରେ: ${excerpt}। ଆଉ କିଛି ସୂଚନା ଦରକାର କି?`;
     } else if (activeLang === 'hi') {
       spokenReply = `हमारे नियमों के अनुसार: ${excerpt}। क्या आप कुछ और जानना चाहते हैं?`;
     } else if (activeLang === 'hinglish') {

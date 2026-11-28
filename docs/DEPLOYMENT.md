@@ -7,7 +7,7 @@ VaniVoice AI runs on **Node.js 22+ native ESM TypeScript execution** (`"start": 
 1. **Docker Build Hygiene (`.dockerignore` + Multi-Stage `Dockerfile`)**:
    - `.dockerignore` excludes `.env*`, `data/`, `node_modules/`, `.git/`, `dist/`, and `.playwright-cli/` from image build contexts so local secrets or databases are never copied into container layers.
    - Stage 1 (`builder`) runs `npm ci` and compiles `dist/` via `npm run build`.
-   - Stage 2 (`runtime`) runs `npm ci --omit=dev`, copies `dist/`, `public/`, `server.ts`, and `src/`, and executes `npm start`.
+   - Stage 2 (`runtime`) runs `npm ci --omit=dev`, copies `dist/`, `public/`, `server.ts`, and `src/`, creates `/app/data` owned by `node`, runs as non-root `USER node`, defines a `HEALTHCHECK` against `http://127.0.0.1:3000/api/health`, and executes `npm start`.
 2. **Production Defaults (`npm start` vs. `npm run dev`)**:
    - `npm start` runs `node server.ts` in **production mode by default** (serves static `dist/` assets and enforces production secret checks).
    - `npm run dev` runs `tsx server.ts --dev` for local development with Vite middleware.
@@ -25,7 +25,7 @@ VaniVoice AI runs on **Node.js 22+ native ESM TypeScript execution** (`"start": 
 
 ## 3. Single Authoritative SQLite Store, Backup/Restore CLI & Firestore Auth/Directory
 
-- **Authoritative Server Persistence (`./data/vanivoice.db`)**: Mount a persistent volume at `/app/data` in container deployments so SQLite retains state across restarts (falls back to `/tmp/vanivoice-data` only if `./data` is read-only). An automatic expiry worker sweeps `call_logs`, `handoff_tickets` (30d), `integration_deliveries` (30d), `support_tickets` (90d), `appointments` (90d), and stale `pending_actions` (24h) on startup and every 15 minutes.
+- **Authoritative Server Persistence (`./data/vanivoice.db` or `DATA_DIR`)**: SQLite runs with `PRAGMA journal_mode = WAL`, `busy_timeout = 5000`, `foreign_keys = ON`, and a partial unique index preventing concurrent confirmed double-bookings. Mount a persistent volume at `/app/data` (or set `DATA_DIR`); production startup fails fast if the data directory is unwritable unless `ALLOW_EPHEMERAL_TMP_DB=true` is explicitly set. An automatic expiry worker sweeps `call_logs`, `handoff_tickets` (30d), `integration_deliveries` (30d), `support_tickets` (90d), `appointments` (90d), and stale `pending_actions` (24h) on startup and every 15 minutes.
 - **Online Backup & Integrity-Checked Restore (`scripts/db-backup.mjs`)**:
   ```bash
   # Hot backup via SQLite VACUUM INTO -> data/backups/vanivoice-<timestamp>.db
@@ -48,9 +48,16 @@ VaniVoice AI runs on **Node.js 22+ native ESM TypeScript execution** (`"start": 
 | `ADMIN_EMAIL` | Optional | Server-only | Explicit Google OIDC email auto-promoted to `super_admin` on verified sign-in (empty by default; never hardcoded) |
 | `FIREBASE_CHECK_REVOKED` | Optional (`false`) | Server-only | Set `true` only on user-owned GCP projects with IAM permissions for Firebase Auth `checkRevoked` checks |
 | `CSP_FRAME_ANCESTORS` | Optional (`'self' ...`) | Server-only | Controls `Content-Security-Policy` `frame-ancestors` (set `'self'` in strict standalone prod) |
-| `WEBHOOK_SIGNING_SECRET` | Optional | Server-only | Fallback HMAC-SHA256 secret for outbound EHR webhooks |
-| `ALLOW_LOCAL_WEBHOOKS` | Optional (`false`) | Server-only | Keep `false` in production (SSRF protection); `true` only for local/automated testing |
+| `TRUST_PROXY` | Optional (`false`) | Server-only | Set `true` only behind a trusted reverse proxy / load balancer so `req.ip` honors `X-Forwarded-For` safely |
+| `WEBHOOK_SIGNING_SECRET` | Optional (required for webhooks without per-tenant secret) | Server-only | Dedicated HMAC-SHA256 signing secret for outbound webhooks (never falls back to `SESSION_SECRET`) |
+| `WEBHOOK_ENCRYPTION_KEY` | Optional (falls back to `SESSION_SECRET`) | Server-only | AES-256-GCM master key used to encrypt per-tenant `webhookConfig.signingSecret` values at rest |
+| `DATA_DIR` | Optional (`./data`) | Server-only | Persistent directory for `vanivoice.db` and `scripts/db-backup.mjs` backups |
+| `ALLOW_EPHEMERAL_TMP_DB` | Optional (`false`) | Server-only | Set `true` only if intentionally allowing `/tmp` fallback when `DATA_DIR` is read-only |
+| `ALLOW_LOCAL_WEBHOOKS` | Optional (`false`) | Server-only | Keep `false` in production (SSRF + DNS-rebinding protection); `true` only for local/automated testing |
+| `ALLOW_DEMO_MODE` / `ALLOW_DEMO_WEBHOOKS` | Optional (`false`) | Server-only | Keep `false` in production so live `/api/turn` rejects demo bypasses and demo turns cannot fire outbound webhooks |
 | `GEMINI_API_KEY` | Optional (required for live AI) | Server-only | Set via secret manager; Offline Demo Mode remains available when unset |
+| `GEMINI_PRIMARY_MODEL` / `GEMINI_FALLBACK_MODEL` | Optional | Server-only | Override default chat (`gemini-4-hydrogen`) and fallback (`gemini-3.1-flash-lite`) model aliases |
+| `RATE_LIMIT_GENERAL` / `TURN` / `AUTH` / `SUPPORT` | Optional | Server-only | Override 60-second per-IP limits (`180` / `60` / `15` / `10`) |
 | `PORT` | Optional | Server | Defaults to `3000` |
 
 ---

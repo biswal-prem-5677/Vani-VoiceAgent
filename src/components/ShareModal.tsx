@@ -11,7 +11,7 @@ export const ShareModal: React.FC<ShareModalProps> = ({ isOpen, onClose }) => {
 
   if (!isOpen) return null;
 
-  const shareUrl = typeof window !== 'undefined' ? window.location.href : 'https://ais-pre-347hijkv3vozqobgqtarxq-690031145141.asia-northeast1.run.app/';
+  const shareUrl = typeof window !== 'undefined' ? window.location.href : '';
   const shareTitle = 'VaniVoice AI - Multilingual Multi-Tenant Voice Agent';
   const shareText = 'Check out VaniVoice AI: a multilingual voice agent supporting Odia, Hindi, Hinglish, Bengali, and English with sub-second turnaround and safety routing.';
 

@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { X, Headphones, Send, Mail, CheckCircle2, MessageSquare, AlertCircle } from 'lucide-react';
+import { X, Headphones, Send, Mail, CheckCircle2, AlertCircle } from 'lucide-react';
 
 interface SupportDeskModalProps {
   isOpen: boolean;

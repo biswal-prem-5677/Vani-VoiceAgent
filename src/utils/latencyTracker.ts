@@ -8,7 +8,7 @@ export interface LatencyStats {
 
 export function calculatePercentiles(latencies: number[]): LatencyStats {
   if (latencies.length === 0) {
-    return { p50: 0, p95: 0, average: 0, count: 0, underOneSecondPercent: 100 };
+    return { p50: 0, p95: 0, average: 0, count: 0, underOneSecondPercent: 0 };
   }
 
   const sorted = [...latencies].sort((a, b) => a - b);

@@ -1,4 +1,9 @@
 import crypto from 'node:crypto';
+import { promisify } from 'node:util';
+
+const scryptAsync = promisify(crypto.scrypt);
+const TOKEN_ISSUER = 'vanivoice-api';
+const TOKEN_AUDIENCE = 'vanivoice-client';
 
 export type UserRole = 'caller' | 'tenant_admin' | 'super_admin';
 
@@ -10,6 +15,8 @@ export interface SessionTokenPayload {
   role: UserRole;
   allowedTenants: string[];
   ver?: number;
+  iss?: string;
+  aud?: string;
   iat: number;
   exp: number;
 }
@@ -20,6 +27,12 @@ export function hashPassword(password: string): string {
   return `${salt}:${derived}`;
 }
 
+export async function hashPasswordAsync(password: string): Promise<string> {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const derived = (await scryptAsync(password, salt, 64)) as Buffer;
+  return `${salt}:${derived.toString('hex')}`;
+}
+
 export function verifyPassword(password: string, storedHash: string): boolean {
   const parts = storedHash.split(':');
   if (parts.length !== 2) return false;
@@ -28,6 +41,22 @@ export function verifyPassword(password: string, storedHash: string): boolean {
 
   try {
     const derived = crypto.scryptSync(password, salt, 64);
+    const expected = Buffer.from(expectedHex, 'hex');
+    if (derived.length !== expected.length) return false;
+    return crypto.timingSafeEqual(derived, expected);
+  } catch {
+    return false;
+  }
+}
+
+export async function verifyPasswordAsync(password: string, storedHash: string): Promise<boolean> {
+  const parts = storedHash.split(':');
+  if (parts.length !== 2) return false;
+  const [salt, expectedHex] = parts;
+  if (!salt || !expectedHex) return false;
+
+  try {
+    const derived = (await scryptAsync(password, salt, 64)) as Buffer;
     const expected = Buffer.from(expectedHex, 'hex');
     if (derived.length !== expected.length) return false;
     return crypto.timingSafeEqual(derived, expected);
@@ -58,13 +87,15 @@ function base64UrlDecode(input: string): string {
 }
 
 export function signSessionToken(
-  claims: Omit<SessionTokenPayload, 'iat' | 'exp'>,
+  claims: Omit<SessionTokenPayload, 'iat' | 'exp' | 'iss' | 'aud'>,
   secret: string,
-  ttlSeconds = 12 * 3600
+  ttlSeconds = 8 * 3600
 ): string {
   const nowSec = Math.floor(Date.now() / 1000);
   const fullPayload: SessionTokenPayload = {
     ...claims,
+    iss: TOKEN_ISSUER,
+    aud: TOKEN_AUDIENCE,
     iat: nowSec,
     exp: nowSec + ttlSeconds,
   };
@@ -96,7 +127,13 @@ export function verifySessionToken(
     }
 
     const parsed = JSON.parse(base64UrlDecode(encodedPayload)) as SessionTokenPayload;
-    if (!parsed || typeof parsed.exp !== 'number' || typeof parsed.role !== 'string') {
+    if (
+      !parsed ||
+      typeof parsed.exp !== 'number' ||
+      typeof parsed.role !== 'string' ||
+      parsed.iss !== TOKEN_ISSUER ||
+      parsed.aud !== TOKEN_AUDIENCE
+    ) {
       return null;
     }
     if (Math.floor(Date.now() / 1000) >= parsed.exp) {

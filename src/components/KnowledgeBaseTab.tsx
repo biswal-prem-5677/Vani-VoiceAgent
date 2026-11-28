@@ -5,11 +5,7 @@ import {
   Search,
   Trash2,
   Tag,
-  Calendar,
   Sparkles,
-  CheckCircle2,
-  FileText,
-  SlidersHorizontal,
 } from 'lucide-react';
 import { TenantConfig, DocumentChunk } from '../types';
 import { searchKnowledgeBase, chunkDocumentText } from '../utils/ragEngine';

@@ -45,6 +45,25 @@ async function waitForHealth(baseUrl: string, proc: ChildProcess, stderrChunks: 
   throw new Error(`Timed out waiting for server health: ${stderrChunks.join('')}`);
 }
 
+async function pollWebhookDelivery(
+  baseUrl: string,
+  adminHeaders: Record<string, string>,
+  predicate: (delivery: any) => boolean,
+  timeoutMs = 5000
+): Promise<any> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const res = await fetch(`${baseUrl}/api/integrations`, { headers: adminHeaders });
+    if (res.ok) {
+      const deliveries = (await res.json()) as any[];
+      const match = deliveries.find(predicate);
+      if (match) return match;
+    }
+    await new Promise(r => setTimeout(r, 50));
+  }
+  throw new Error('Timed out waiting for matching webhook delivery record');
+}
+
 function makeTempWorkdir(): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vanivoice-int-'));
   // Ensure dist/index.html exists for non-dev mode fallback checks
@@ -123,6 +142,20 @@ test('Integration: Production server boots with bootstrap token, enforces clinic
     assert.strictEqual(sessionJson.bootstrapRequiresToken, true);
     assert.strictEqual(sessionJson.retentionPolicy.safetyTicketDays, 30);
     assert.strictEqual(sessionJson.retentionPolicy.supportTicketDays, 90);
+    assert.strictEqual(sessionJson.modelUsed, undefined, 'Unauthenticated /api/session must omit modelUsed');
+
+    // Verify weak password (< 12 chars) rejected on bootstrap
+    const weakBoot = await fetch(`${baseUrl}/api/auth/bootstrap`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Lead Admin',
+        email: 'lead@clinic.org',
+        password: 'short',
+        bootstrapToken,
+      }),
+    });
+    assert.strictEqual(weakBoot.status, 400);
 
     // 2. Verify bootstrap rejects wrong/missing token and accepts valid token
     const badBoot = await fetch(`${baseUrl}/api/auth/bootstrap`, {
@@ -150,6 +183,19 @@ test('Integration: Production server boots with bootstrap token, enforces clinic
     assert.strictEqual(goodBoot.status, 201);
     const adminAuth = (await goodBoot.json()) as any;
     assert.ok(adminAuth.token);
+
+    // Bootstrap stays permanently locked once completed
+    const repeatBoot = await fetch(`${baseUrl}/api/auth/bootstrap`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Rogue Admin',
+        email: 'rogue@clinic.org',
+        password: 'StrongPassword123!',
+        bootstrapToken,
+      }),
+    });
+    assert.strictEqual(repeatBoot.status, 409);
 
     // 3. Create Caller Session
     const callerRes = await fetch(`${baseUrl}/api/auth/caller-session`, { method: 'POST' });
@@ -360,6 +406,102 @@ test('Integration: Production server boots with bootstrap token, enforces clinic
       false,
       'Caller handoff tickets must be deleted by DELETE /api/session/data'
     );
+
+    // 12. Concurrent double-booking race on 04:00 PM -> exactly 1 succeeds and 1 gets conflict
+    const raceCallerA = (await (await fetch(`${baseUrl}/api/auth/caller-session`, { method: 'POST' })).json()) as any;
+    const raceCallerB = (await (await fetch(`${baseUrl}/api/auth/caller-session`, { method: 'POST' })).json()) as any;
+    const raceHeadersA = { 'Content-Type': 'application/json', Authorization: `Bearer ${raceCallerA.token}` };
+    const raceHeadersB = { 'Content-Type': 'application/json', Authorization: `Bearer ${raceCallerB.token}` };
+
+    const [raceStep1A, raceStep1B] = await Promise.all([
+      fetch(`${baseUrl}/api/turn`, {
+        method: 'POST',
+        headers: raceHeadersA,
+        body: JSON.stringify({
+          tenantId: 'kalinga_clinic',
+          userText: 'Book appointment with Dr. Jena at 04:00 PM. My name is Suman',
+          language: 'en',
+          demoMode: true,
+        }),
+      }).then(r => r.json() as Promise<any>),
+      fetch(`${baseUrl}/api/turn`, {
+        method: 'POST',
+        headers: raceHeadersB,
+        body: JSON.stringify({
+          tenantId: 'kalinga_clinic',
+          userText: 'Book appointment with Dr. Jena at 04:00 PM. My name is Vikram',
+          language: 'en',
+          demoMode: true,
+        }),
+      }).then(r => r.json() as Promise<any>),
+    ]);
+
+    const [raceConfirmA, raceConfirmB] = await Promise.all([
+      fetch(`${baseUrl}/api/turn`, {
+        method: 'POST',
+        headers: raceHeadersA,
+        body: JSON.stringify({
+          tenantId: 'kalinga_clinic',
+          userText: 'Yes confirm please',
+          language: 'en',
+          memory: raceStep1A.memoryUpdates,
+          demoMode: true,
+        }),
+      }).then(r => r.json() as Promise<any>),
+      fetch(`${baseUrl}/api/turn`, {
+        method: 'POST',
+        headers: raceHeadersB,
+        body: JSON.stringify({
+          tenantId: 'kalinga_clinic',
+          userText: 'Yes confirm please',
+          language: 'en',
+          memory: raceStep1B.memoryUpdates,
+          demoMode: true,
+        }),
+      }).then(r => r.json() as Promise<any>),
+    ]);
+
+    const raceResults = [raceConfirmA.toolCalls?.[0]?.result, raceConfirmB.toolCalls?.[0]?.result];
+    const winners = raceResults.filter(r => r?.success === true);
+    const losers = raceResults.filter(r => r?.success === false && r?.data?.conflict === true);
+    assert.strictEqual(winners.length, 1, 'Exactly one concurrent caller must win the 04:00 PM slot');
+    assert.strictEqual(losers.length, 1, 'Exactly one concurrent caller must receive slot conflict');
+
+    // 13. Unknown API route must return 404 JSON rather than SPA index.html
+    const missingApiRes = await fetch(`${baseUrl}/api/nonexistent-endpoint-check`);
+    assert.strictEqual(missingApiRes.status, 404);
+    const missingApiJson = (await missingApiRes.json()) as any;
+    assert.ok(missingApiJson.error);
+
+    // 14. Tenant SSRF validation rejects embedded credentials & metadata IPs in production
+    const tenantCfg = (await (await fetch(`${baseUrl}/api/tenants/kalinga_clinic`, { headers: adminHeaders })).json()) as any;
+    const ssrfMetaRes = await fetch(`${baseUrl}/api/tenants/kalinga_clinic`, {
+      method: 'POST',
+      headers: adminHeaders,
+      body: JSON.stringify({
+        ...tenantCfg,
+        webhookConfig: {
+          enabled: true,
+          url: 'https://169.254.169.254/latest/meta-data',
+          providerType: 'clinic_ehr_webhook',
+        },
+      }),
+    });
+    assert.strictEqual(ssrfMetaRes.status, 400);
+
+    const ssrfCredsRes = await fetch(`${baseUrl}/api/tenants/kalinga_clinic`, {
+      method: 'POST',
+      headers: adminHeaders,
+      body: JSON.stringify({
+        ...tenantCfg,
+        webhookConfig: {
+          enabled: true,
+          url: 'https://user:pass@ehr.example.com/webhook',
+          providerType: 'clinic_ehr_webhook',
+        },
+      }),
+    });
+    assert.strictEqual(ssrfCredsRes.status, 400);
   } finally {
     proc.kill('SIGTERM');
     await new Promise(resolve => proc.once('exit', resolve));
@@ -413,6 +555,7 @@ test('Integration: Outbound webhook dispatch retries failed attempts with HMAC s
       ADMIN_PASSCODE: '',
       GEMINI_API_KEY: '',
       ALLOW_LOCAL_WEBHOOKS: 'true',
+      ALLOW_DEMO_WEBHOOKS: 'true',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -489,6 +632,14 @@ test('Integration: Outbound webhook dispatch retries failed attempts with HMAC s
 
     const bookingRef = confirmRes.toolCalls?.[0]?.result?.data?.bookingRef;
     assert.ok(bookingRef);
+
+    // Webhook delivery on /api/turn is queued asynchronously; poll until terminal delivered status
+    const deliveredBooking = await pollWebhookDelivery(
+      baseUrl,
+      adminHeaders,
+      d => d.eventType === 'appointment.booked' && d.status === 'delivered'
+    );
+    assert.strictEqual(deliveredBooking.status, 'delivered');
     assert.ok(attemptsReceived >= 2, 'Expected automatic retry after HTTP 500');
     assert.strictEqual(receivedEvents.length, 1);
     const sigHeader = String(receivedEvents[0].headers['x-vanivoice-signature'] || '');
@@ -521,8 +672,11 @@ test('Integration: Outbound webhook dispatch retries failed attempts with HMAC s
     });
     assert.strictEqual(emergencyTurn.status, 200);
 
-    const deliveries = (await (await fetch(`${baseUrl}/api/integrations`, { headers: adminHeaders })).json()) as any[];
-    const failedDel = deliveries.find(d => d.status === 'failed' && d.eventType === 'handoff.created');
+    const failedDel = await pollWebhookDelivery(
+      baseUrl,
+      adminHeaders,
+      d => d.status === 'failed' && d.eventType === 'handoff.created'
+    );
     assert.ok(failedDel, 'Expected failed handoff.created webhook record');
 
     forceFail = false;
@@ -694,4 +848,335 @@ test('Integration: Outbound webhook dispatch retries failed attempts with HMAC s
     fs.rmSync(workdir, { recursive: true, force: true });
   }
 });
+
+test('Integration: Audit P0/P1 checks (last-admin lock, cross-session log 409, idempotency conflict 409, invalid slot & negative confirm, demo webhook gating, XFF spoof guard, and support ticket RBAC)', async () => {
+  const workdir = makeTempWorkdir();
+  const port = await getFreePort();
+  const baseUrl = `http://127.0.0.1:${port}`;
+  const sessionSecret = '0123456789abcdef0123456789abcdef0123456789abcdef';
+  const bootstrapToken = 'boot-audit-checks-987654';
+
+  const webhookRequests: string[] = [];
+  const webhookServer = http.createServer((req, res) => {
+    webhookRequests.push(req.url || '/');
+    res.statusCode = 200;
+    res.end('ok');
+  });
+  await new Promise<void>(resolve => webhookServer.listen(0, '127.0.0.1', () => resolve()));
+  const webhookAddr = webhookServer.address();
+  const webhookPort = typeof webhookAddr === 'object' && webhookAddr ? webhookAddr.port : 0;
+  const webhookUrl = `http://127.0.0.1:${webhookPort}/hook`;
+
+  const proc = spawn(process.execPath, [SERVER_ENTRY], {
+    cwd: workdir,
+    env: {
+      ...process.env,
+      NODE_ENV: 'production',
+      PORT: String(port),
+      SESSION_SECRET: sessionSecret,
+      ADMIN_BOOTSTRAP_TOKEN: bootstrapToken,
+      ADMIN_PASSCODE: 'env-passcode-1234',
+      GEMINI_API_KEY: '',
+      ALLOW_LOCAL_WEBHOOKS: 'true',
+      RATE_LIMIT_SUPPORT: '2',
+      // Intentionally omit ALLOW_DEMO_WEBHOOKS and TRUST_PROXY
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  const stderrChunks: string[] = [];
+  proc.stderr?.on('data', d => stderrChunks.push(d.toString()));
+
+  try {
+    await waitForHealth(baseUrl, proc, stderrChunks);
+
+    // 1. Login via ADMIN_PASSCODE (usr_env_admin) and create 1 registered super_admin + 1 tenant_admin
+    const envAdminLogin = await fetch(`${baseUrl}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'env@workspace.local', password: 'env-passcode-1234' }),
+    });
+    assert.strictEqual(envAdminLogin.status, 200);
+    const envAdminAuth = (await envAdminLogin.json()) as any;
+    const superHeaders = {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${envAdminAuth.token}`,
+    };
+
+    // Authenticated admin session includes modelUsed
+    const adminSessionJson = (await (await fetch(`${baseUrl}/api/session`, { headers: superHeaders })).json()) as any;
+    assert.ok(adminSessionJson.modelUsed, 'Authenticated admin /api/session should include modelUsed');
+
+    // Short password rejected on user create
+    const weakUserRes = await fetch(`${baseUrl}/api/auth/users`, {
+      method: 'POST',
+      headers: superHeaders,
+      body: JSON.stringify({
+        name: 'Short Pass',
+        email: 'short@kalinga.org',
+        password: 'short',
+        role: 'tenant_admin',
+        allowedTenants: ['kalinga_clinic'],
+      }),
+    });
+    assert.strictEqual(weakUserRes.status, 400);
+
+    // Create sole super_admin user in DB and verify last super_admin cannot be demoted or revoked
+    const saRes = await fetch(`${baseUrl}/api/auth/users`, {
+      method: 'POST',
+      headers: superHeaders,
+      body: JSON.stringify({
+        name: 'Sole Super',
+        email: 'sole@workspace.org',
+        password: 'SuperStrongPass123!',
+        role: 'super_admin',
+        allowedTenants: ['*'],
+      }),
+    });
+    assert.strictEqual(saRes.status, 201);
+    const saUser = (await saRes.json()) as any;
+
+    const demoteLastRes = await fetch(`${baseUrl}/api/auth/users/${saUser.user.id}/role`, {
+      method: 'PATCH',
+      headers: superHeaders,
+      body: JSON.stringify({ role: 'tenant_admin', allowedTenants: ['kalinga_clinic'] }),
+    });
+    assert.strictEqual(demoteLastRes.status, 409);
+
+    const revokeLastRes = await fetch(`${baseUrl}/api/auth/users/${saUser.user.id}/revoke`, {
+      method: 'POST',
+      headers: superHeaders,
+      body: JSON.stringify({ revoked: true }),
+    });
+    assert.strictEqual(revokeLastRes.status, 409);
+
+    // 2. Configure webhook without ALLOW_DEMO_WEBHOOKS -> demoMode turn must NOT fire webhook
+    const clinicCfg = (await (await fetch(`${baseUrl}/api/tenants/kalinga_clinic`, { headers: superHeaders })).json()) as any;
+    clinicCfg.webhookConfig = {
+      enabled: true,
+      url: webhookUrl,
+      providerType: 'clinic_ehr_webhook',
+      signingSecret: 'whsec_test_123456',
+    };
+    await fetch(`${baseUrl}/api/tenants/kalinga_clinic`, {
+      method: 'POST',
+      headers: superHeaders,
+      body: JSON.stringify(clinicCfg),
+    });
+
+    const caller1 = (await (await fetch(`${baseUrl}/api/auth/caller-session`, { method: 'POST' })).json()) as any;
+    const caller1Headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${caller1.token}` };
+
+    const demoEmergency = await fetch(`${baseUrl}/api/turn`, {
+      method: 'POST',
+      headers: caller1Headers,
+      body: JSON.stringify({
+        tenantId: 'kalinga_clinic',
+        userText: 'Severe chest pain emergency!',
+        language: 'en',
+        demoMode: true,
+      }),
+    });
+    assert.strictEqual(demoEmergency.status, 200);
+    await new Promise(r => setTimeout(r, 150));
+    assert.strictEqual(webhookRequests.length, 0, 'demoMode turns must not dispatch webhooks unless ALLOW_DEMO_WEBHOOKS=true');
+
+    // 3. Invalid OPD slot & negative confirmation check
+    const step1 = (await (await fetch(`${baseUrl}/api/turn`, {
+      method: 'POST',
+      headers: caller1Headers,
+      body: JSON.stringify({
+        tenantId: 'kalinga_clinic',
+        userText: 'Book appointment with Dr. Jena at 10:00 AM. My name is Meera',
+        language: 'en',
+        idempotencyKey: 'idem-payload-check',
+        demoMode: true,
+      }),
+    })).json()) as any;
+    assert.strictEqual(step1.toolCalls?.[0]?.result?.requiresConfirmation, true);
+
+    // Idempotency-Key reused with different body -> 409 IDEMPOTENCY_CONFLICT
+    const idemConflictRes = await fetch(`${baseUrl}/api/turn`, {
+      method: 'POST',
+      headers: caller1Headers,
+      body: JSON.stringify({
+        tenantId: 'kalinga_clinic',
+        userText: 'Different request text altogether',
+        language: 'en',
+        idempotencyKey: 'idem-payload-check',
+        demoMode: true,
+      }),
+    });
+    assert.strictEqual(idemConflictRes.status, 409);
+
+    // "Yes, do not confirm my booking" must NOT confirm appointment
+    const negConfirmRes = (await (await fetch(`${baseUrl}/api/turn`, {
+      method: 'POST',
+      headers: caller1Headers,
+      body: JSON.stringify({
+        tenantId: 'kalinga_clinic',
+        userText: 'Yes, do not confirm my booking',
+        language: 'en',
+        memory: step1.memoryUpdates,
+        demoMode: true,
+      }),
+    })).json()) as any;
+    assert.strictEqual(negConfirmRes.toolCalls?.[0]?.result?.requiresConfirmation, true);
+    assert.strictEqual(negConfirmRes.toolCalls?.[0]?.result?.data?.bookingRef, undefined);
+
+    // Invalid Sunday OPD slot must be rejected by tool validation without creating an appointment
+    const sundayRes = (await (await fetch(`${baseUrl}/api/turn`, {
+      method: 'POST',
+      headers: caller1Headers,
+      body: JSON.stringify({
+        tenantId: 'kalinga_clinic',
+        userText: 'Book appointment with Dr. Jena on Sunday 10:00 AM. My name is Meera',
+        language: 'en',
+        demoMode: true,
+      }),
+    })).json()) as any;
+    assert.strictEqual(sundayRes.toolCalls?.[0]?.result?.success, false);
+    assert.strictEqual(sundayRes.toolCalls?.[0]?.result?.data?.bookingRef, undefined);
+    const apptsAfterInvalid = (await (await fetch(`${baseUrl}/api/appointments`, { headers: superHeaders })).json()) as any[];
+    assert.strictEqual(apptsAfterInvalid.length, 0);
+
+    // 4. Cross-session POST /api/logs ID collision -> 409 LOG_ID_CONFLICT
+    await fetch(`${baseUrl}/api/consent`, {
+      method: 'POST',
+      headers: caller1Headers,
+      body: JSON.stringify({ consented: true, retentionDays: 30, tenantId: 'kalinga_clinic' }),
+    });
+    const logPayload = {
+      id: 'call_shared_collision_test',
+      tenantId: 'kalinga_clinic',
+      tenantName: 'Kalinga Care Multispeciality Clinic',
+      callerNumber: 'Web',
+      callerName: 'Caller A',
+      startedAt: new Date().toISOString(),
+      durationSeconds: 10,
+      languagesUsed: ['en'],
+      detectedIntent: 'general_inquiry',
+      turns: [{ id: 't1', speaker: 'user', text: 'Hello', timestamp: Date.now() }],
+      metrics: {
+        averageLatencyMs: 100,
+        p95LatencyMs: 100,
+        bargeInCount: 0,
+        toolsExecutedCount: 0,
+        taskCompleted: true,
+        handedOffToHuman: false,
+      },
+    };
+    const logA = await fetch(`${baseUrl}/api/logs`, {
+      method: 'POST',
+      headers: caller1Headers,
+      body: JSON.stringify(logPayload),
+    });
+    assert.strictEqual(logA.status, 201);
+
+    const caller2 = (await (await fetch(`${baseUrl}/api/auth/caller-session`, { method: 'POST' })).json()) as any;
+    const caller2Headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${caller2.token}` };
+    await fetch(`${baseUrl}/api/consent`, {
+      method: 'POST',
+      headers: caller2Headers,
+      body: JSON.stringify({ consented: true, retentionDays: 30, tenantId: 'kalinga_clinic' }),
+    });
+    const logB = await fetch(`${baseUrl}/api/logs`, {
+      method: 'POST',
+      headers: caller2Headers,
+      body: JSON.stringify(logPayload),
+    });
+    assert.strictEqual(logB.status, 409);
+
+    // 5. Support tickets RBAC & X-Forwarded-For rate-limit spoof protection
+    const konarkTicketRes = await fetch(`${baseUrl}/api/support/ticket`, {
+      method: 'POST',
+      headers: { ...caller1Headers, 'X-Forwarded-For': '1.1.1.1' },
+      body: JSON.stringify({
+        name: 'Ravi',
+        email: 'ravi@example.com',
+        subject: 'Konark question',
+        message: 'Checking delivery ticket RBAC',
+        tenantId: 'konark_logistics',
+      }),
+    });
+    assert.strictEqual(konarkTicketRes.status, 201);
+    const konarkTicket = (await konarkTicketRes.json()) as any;
+
+    const globalTicketRes = await fetch(`${baseUrl}/api/support/ticket`, {
+      method: 'POST',
+      headers: { ...caller1Headers, 'X-Forwarded-For': '2.2.2.2' },
+      body: JSON.stringify({
+        name: 'Ravi',
+        email: 'ravi@example.com',
+        subject: 'Global question',
+        message: 'Checking global ticket RBAC',
+      }),
+    });
+    assert.strictEqual(globalTicketRes.status, 201);
+    const globalTicket = (await globalTicketRes.json()) as any;
+
+    // 3rd support ticket with spoofed X-Forwarded-For hits RATE_LIMIT_SUPPORT=2
+    const rateLimitedSupport = await fetch(`${baseUrl}/api/support/ticket`, {
+      method: 'POST',
+      headers: { ...caller1Headers, 'X-Forwarded-For': '3.3.3.3' },
+      body: JSON.stringify({
+        name: 'Ravi',
+        email: 'ravi@example.com',
+        subject: 'Third request',
+        message: 'Should be rate limited despite X-Forwarded-For spoof',
+      }),
+    });
+    assert.strictEqual(rateLimitedSupport.status, 429);
+
+    // Create tenant_admin scoped ONLY to kalinga_clinic
+    await fetch(`${baseUrl}/api/auth/users`, {
+      method: 'POST',
+      headers: superHeaders,
+      body: JSON.stringify({
+        name: 'Kalinga Admin',
+        email: 'kadmin@kalinga.org',
+        password: 'KalingaAdminPass123!',
+        role: 'tenant_admin',
+        allowedTenants: ['kalinga_clinic'],
+      }),
+    });
+    const kLogin = (await (await fetch(`${baseUrl}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'kadmin@kalinga.org', password: 'KalingaAdminPass123!' }),
+    })).json()) as any;
+    const kHeaders = { 'Content-Type': 'application/json', Authorization: `Bearer ${kLogin.token}` };
+
+    const scopedTickets = (await (await fetch(`${baseUrl}/api/support/tickets`, { headers: kHeaders })).json()) as any[];
+    assert.strictEqual(scopedTickets.some(t => t.id === konarkTicket.ticketId), false);
+    assert.strictEqual(scopedTickets.some(t => t.id === globalTicket.ticketId), false);
+
+    const crossPatch = await fetch(`${baseUrl}/api/support/tickets/${konarkTicket.ticketId}`, {
+      method: 'PATCH',
+      headers: kHeaders,
+      body: JSON.stringify({ status: 'resolved' }),
+    });
+    assert.strictEqual(crossPatch.status, 403);
+
+    const globalPatchDenied = await fetch(`${baseUrl}/api/support/tickets/${globalTicket.ticketId}`, {
+      method: 'PATCH',
+      headers: kHeaders,
+      body: JSON.stringify({ status: 'resolved' }),
+    });
+    assert.strictEqual(globalPatchDenied.status, 403);
+
+    const superPatchGlobal = await fetch(`${baseUrl}/api/support/tickets/${globalTicket.ticketId}`, {
+      method: 'PATCH',
+      headers: superHeaders,
+      body: JSON.stringify({ status: 'resolved' }),
+    });
+    assert.strictEqual(superPatchGlobal.status, 200);
+  } finally {
+    webhookServer.close();
+    proc.kill('SIGTERM');
+    await new Promise(resolve => proc.once('exit', resolve));
+    fs.rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 

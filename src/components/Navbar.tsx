@@ -1,7 +1,6 @@
 import React, { useState } from 'react';
 import {
   ChevronDown,
-  Building2,
   BookOpen,
   Sliders,
   FileText,

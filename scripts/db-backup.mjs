@@ -9,7 +9,8 @@ function printUsage() {
 }
 
 const [, , command = 'backup', targetArg] = process.argv;
-const dataDir = path.resolve(process.cwd(), 'data');
+const configuredDataDir = process.env.DATA_DIR?.trim();
+const dataDir = configuredDataDir ? path.resolve(configuredDataDir) : path.resolve(process.cwd(), 'data');
 const liveDbPath = path.join(dataDir, 'vanivoice.db');
 
 if (command === 'backup') {

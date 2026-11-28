@@ -145,9 +145,22 @@ export interface CallLog {
     toolsExecutedCount: number;
     taskCompleted: boolean;
     handedOffToHuman: boolean;
-    satisfactionScore: number;
+    satisfactionScore?: number;
   };
   capturedMemory: Record<string, string>;
+}
+
+export interface SupportTicketRecord {
+  id: string;
+  tenantId: string | null;
+  sessionId: string | null;
+  name: string;
+  email: string;
+  subject: string;
+  message: string;
+  status: 'open' | 'in_progress' | 'resolved';
+  createdAt: number;
+  expiresAt: number | null;
 }
 
 export interface BenchmarkCase {

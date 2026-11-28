@@ -13,13 +13,20 @@ const REDACTED_KEYS = new Set([
   'apikey',
   'gemini_api_key',
   'session_secret',
+  'webhook_signing_secret',
+  'webhook_encryption_key',
+  'admin_passcode',
+  'admin_bootstrap_token',
 ]);
 
 export function redactSensitiveValue(value: unknown, depth = 0): unknown {
-  if (depth > 4 || value === null || value === undefined) return value;
+  if (value === null || value === undefined) return value;
+  if (depth > 8) return '[TRUNCATED]';
   if (typeof value === 'string') {
-    if (value.startsWith('Bearer ')) return 'Bearer [REDACTED]';
-    return value;
+    let scrubbed = value.replace(/Bearer\s+[A-Za-z0-9._-]+/gi, 'Bearer [REDACTED]');
+    scrubbed = scrubbed.replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]*)?/g, '[JWT_REDACTED]');
+    scrubbed = scrubbed.replace(/\bAIza[0-9A-Za-z_-]{20,}\b/g, '[API_KEY_REDACTED]');
+    return scrubbed;
   }
   if (Array.isArray(value)) {
     return value.slice(0, 20).map(item => redactSensitiveValue(item, depth + 1));

@@ -1,4 +1,4 @@
-import { doc, setDoc, serverTimestamp } from 'firebase/firestore';
+import { doc, getDoc, setDoc, updateDoc, serverTimestamp } from 'firebase/firestore';
 import { getFirebaseDb, handleFirestoreError, OperationType } from './firebase';
 import type { AuthUser, TenantConfig } from '../types';
 
@@ -9,26 +9,33 @@ function sanitizeId(raw: string, fallbackPrefix: string): string {
 
 /**
  * Syncs minimal OIDC user profile metadata to Firestore.
- * Operational data (transcripts, handoff tickets, appointments, webhooks, support tickets)
- * is stored strictly in the authoritative server-side database via /api/* endpoints.
+ * Creates with least-privilege role ('caller', revoked: false) on first sign-in and
+ * updates only mutable fields ('displayName', 'updatedAt') on repeat logins to satisfy firestore.rules.
  */
 export async function upsertUserProfileInFirestore(user: AuthUser, uid: string): Promise<void> {
   const path = `users/${uid}`;
   try {
     const db = getFirebaseDb();
-    await setDoc(
-      doc(db, 'users', uid),
-      {
+    const userRef = doc(db, 'users', uid);
+    const displayName = (user.name || 'Workspace User').slice(0, 120);
+    const snap = await getDoc(userRef);
+
+    if (!snap.exists()) {
+      await setDoc(userRef, {
         uid,
         email: user.email.slice(0, 160),
-        displayName: (user.name || 'Workspace User').slice(0, 120),
-        role: user.role,
+        displayName,
+        role: 'caller',
         revoked: false,
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
-      },
-      { merge: true }
-    );
+      });
+    } else {
+      await updateDoc(userRef, {
+        displayName,
+        updatedAt: serverTimestamp(),
+      });
+    }
   } catch (error) {
     try {
       handleFirestoreError(error, OperationType.WRITE, path);

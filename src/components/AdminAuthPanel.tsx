@@ -225,14 +225,14 @@ export const AdminAuthPanel: React.FC<AdminAuthPanelProps> = ({
 
         <div>
           <label className="block text-slate-300 font-medium mb-1">
-            {passcodeConfigured && !adminBootstrapNeeded ? 'Password or Workspace Passcode' : 'Password (min 8 chars)'}
+            {passcodeConfigured && !adminBootstrapNeeded ? 'Password or Workspace Passcode' : 'Password (min 12 chars)'}
           </label>
           <div className="relative">
             <KeyRound className="w-3.5 h-3.5 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2" />
             <input
               type="password"
               required
-              minLength={adminBootstrapNeeded ? 8 : 1}
+              minLength={adminBootstrapNeeded ? 12 : 1}
               value={password}
               onChange={e => setPassword(e.target.value)}
               placeholder={adminBootstrapNeeded ? 'Choose a strong password' : 'Enter password'}

@@ -1,4 +1,5 @@
 import type { SupportedLanguage } from '../types/index.ts';
+import { DEFAULT_CLINIC_SLOTS, isValidClinicSlot } from './actionConfirmation.ts';
 
 export interface ToolExecutionResult {
   success: boolean;
@@ -55,6 +56,19 @@ export function executeTenantTool(
           outputMessage: prompt,
           missingParameters: missing,
           data: { parametersReceived: parameters },
+        };
+      }
+
+      const slotValidation = isValidClinicSlot(parameters.slot);
+      if (!slotValidation.valid) {
+        return {
+          success: false,
+          toolName,
+          outputMessage: `${slotValidation.reason} Available OPD slot times: ${DEFAULT_CLINIC_SLOTS.join(', ')}.`,
+          data: {
+            invalidSlot: true,
+            availableSlots: [...DEFAULT_CLINIC_SLOTS],
+          },
         };
       }
 
@@ -218,7 +232,7 @@ export function executeTenantTool(
       return {
         success: true,
         toolName,
-        outputMessage: `New batch for ${exam} commences this Monday. Class timings: 4:30 PM to 8:00 PM. Limited demo seats vacant.`,
+        outputMessage: `New batch for ${exam} commences this Monday. Morning batch: 7:00 AM - 11:30 AM; Evening batch: 4:30 PM - 8:30 PM. Limited demo seats vacant.`,
         data: { exam, batchStart: 'This Monday' },
       };
     }
@@ -234,8 +248,15 @@ export function executeTenantTool(
           data: {},
         };
       }
-      const branch = parameters.branch || 'Computer Science';
-      const cutoff = 18500;
+      const branch = String(parameters.branch || 'Computer Science').trim();
+      const lowerBranch = branch.toLowerCase();
+      const cutoff = lowerBranch.includes('electron') || lowerBranch.includes('ece')
+        ? 34000
+        : lowerBranch.includes('mech')
+        ? 42000
+        : lowerBranch.includes('civil')
+        ? 48000
+        : 18500;
       const eligible = rank <= cutoff;
       return {
         success: true,

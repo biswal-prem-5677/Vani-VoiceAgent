@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import {
   Code,
   Copy,
@@ -8,8 +8,6 @@ import {
   PhoneCall,
   X,
   Volume2,
-  Mic,
-  Zap,
   Info,
 } from 'lucide-react';
 import { TenantConfig } from '../types';
@@ -29,6 +27,12 @@ export const WidgetEmbedSimulator: React.FC<WidgetEmbedSimulatorProps> = ({ tena
 
   // Create speech controller once
   const speechCtrl = useMemo(() => createSpeechController(), []);
+
+  useEffect(() => {
+    return () => {
+      speechCtrl.stop();
+    };
+  }, [speechCtrl]);
 
   const handleOpenWidget = () => {
     setWidgetOpen(true);
@@ -87,9 +91,11 @@ export function VoiceAgentWidget() {
   );
 }`;
 
-  const curlSnippet = `# [LIVE WORKING ENDPOINT] Test turn request via curl
+  const curlSnippet = `# [LIVE WORKING ENDPOINT] 1) Mint caller session token, 2) Call /api/turn
+TOKEN=$(curl -s -X POST http://localhost:3000/api/auth/caller-session | node -e "const d=JSON.parse(require('fs').readFileSync(0,'utf8'));console.log(d.token)")
 curl -X POST http://localhost:3000/api/turn \\
   -H "Content-Type: application/json" \\
+  -H "Authorization: Bearer $TOKEN" \\
   -d '{
     "tenantId": "${tenant.id}",
     "userText": "Hello, I want to book an appointment with Dr. Jena tomorrow",

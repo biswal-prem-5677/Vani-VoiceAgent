@@ -10,7 +10,6 @@ interface AudioOrbProps {
 export const AudioOrb: React.FC<AudioOrbProps> = ({
   state,
   volume = 0.5,
-  primaryColor = '#10B981',
   onOrbClick,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);

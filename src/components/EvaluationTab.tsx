@@ -6,11 +6,6 @@ import {
   XCircle,
   Copy,
   Check,
-  Zap,
-  BookOpen,
-  ArrowRight,
-  ShieldAlert,
-  Clock,
   Filter,
 } from 'lucide-react';
 import { BENCHMARK_CASES } from '../data/evalBenchmark';
@@ -81,11 +76,29 @@ export const EvaluationTab: React.FC<EvaluationTabProps> = ({ authToken }) => {
         try {
           const fallbackHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
           if (authToken) fallbackHeaders.Authorization = `Bearer ${authToken}`;
+          let targetTenantId = 'kalinga_clinic';
+          if (
+            tc.expectedTool === 'track_shipment' ||
+            tc.expectedTool === 'reschedule_delivery' ||
+            tc.scenario.includes('Order') ||
+            tc.scenario.includes('Tracking') ||
+            tc.scenario.includes('Return')
+          ) {
+            targetTenantId = 'konark_logistics';
+          } else if (tc.expectedTool === 'check_batch_schedule' || tc.scenario.includes('Batch')) {
+            targetTenantId = 'pragati_coaching';
+          } else if (
+            tc.expectedTool === 'check_branch_cutoff' ||
+            tc.scenario.includes('Cutoff') ||
+            tc.scenario.includes('Admission')
+          ) {
+            targetTenantId = 'utkal_university';
+          }
           const res = await fetch('/api/turn', {
             method: 'POST',
             headers: fallbackHeaders,
             body: JSON.stringify({
-              tenantId: 'kalinga_clinic',
+              tenantId: targetTenantId,
               userText: tc.userInput,
               language: tc.language,
               memory: {},
